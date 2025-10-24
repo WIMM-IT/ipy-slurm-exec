@@ -2,6 +2,13 @@
 
 Jupyter Notebook + Slurm integration, not just an interface.
 
+## `slurm_exec` syntax:
+
+```
+%%slurm_exec [output variable] [list of input variables] [Slurm job options] [GNU environment modules to load]
+Followed by Python code to execute in job.
+```
+
 ## Explain by example
 
 ### Import
@@ -27,7 +34,7 @@ gpu_result = cp.asnumpy(device_vec ** 2)
 
 ### Wait for job to complete
 ```
-Submitted Slurm job 4382780 (folder: /ceph/project/sysadmin/aowenson/Jupyter/NetworkMap/slurm_jobs/slurm-exec-20251024-135830-89596489)
+Submitted Slurm job 4382780 (folder: /project/research/Jupyter/Slurm/slurm-exec-20251024-135830-89596489)
 Job 4382780 completed. Result assigned to 'gpu_result'
 ```
 
