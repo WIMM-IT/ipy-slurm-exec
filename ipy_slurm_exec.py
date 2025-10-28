@@ -2,8 +2,6 @@ from __future__ import print_function
 
 import argparse
 import datetime
-import inspect
-import io
 import json
 import os
 import pickle
@@ -15,133 +13,88 @@ import textwrap
 import time
 import types
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from subprocess import PIPE, Popen
+from typing import Optional, Required
 
-import pandas
 from IPython.core.error import UsageError
 from IPython.core.magic import Magics, line_cell_magic, line_magic, magics_class
 
 
-def modal(func):
-    def wrapped_func(obj, line):
-        result = func(obj, line)
-        if obj._display == "pandas":
-            return pandas.read_table(
-                io.StringIO(result), sep="\s+", on_bad_lines="warn"
-            )
-        else:
-            return result
+@dataclass
+class SBatch:
+    account: Optional[str] = None
+    qos: Optional[str] = None
+    job_name: Optional[str] = None
+    partition: Optional[str] = None
+    time_limit: Optional[str] = None
+    ntasks: Optional[int] = None
+    cpus_per_task: Optional[int] = None
+    gpus: Optional[str] = None
+    mem: Optional[str] = None
 
-    wrapped_func.__doc__ = func.__doc__
-    return wrapped_func
+@dataclass
+class NotebookJob:
+    python_executable: Required[str] = None
+    sbatch_params: Required[SBatch] = None
+    modules: Optional[list[str]] = None
+    modules_purge: Optional[bool] = None
+
+    inputs: Optional[list[str]] = None
+    outputs: Optional[list[str]] = None
+    poll_interval: Optional[int] = None
+    max_wait: Optional[float] = None
 
 
 @magics_class
 class IPySlurmExec(Magics):
     def __init__(self, shell=None, **kwargs):
         super(IPySlurmExec, self).__init__(shell, **kwargs)
-        self._display = "pandas"
-        self._jobs_root = Path.cwd() / "slurm_jobs"
+        self._jobs_root = Path.cwd() / "slurm_exec"
         self._jobs_root.mkdir(parents=True, exist_ok=True)
-
-    @line_magic
-    def slurm(self, line):
-        chunks = line.lower().split()
-        variable, arguments = chunks[0], chunks[1:]
-        if variable == "display":
-            return self._configure_display(arguments)
-
-    def _configure_display(self, arguments):
-        if arguments:
-            mode = arguments[0]
-            if mode not in ["pandas", "raw"]:
-                raise ValueError("Unknown Slurm magics display mode", mode)
-            self._display = mode
-        return self._display
 
     @line_cell_magic
     def slurm_exec(self, line, cell=None):
         """Execute Python code on a Slurm allocation and capture the result back into the notebook."""
         if cell is None:
             raise UsageError("%%slurm_exec must be used as a cell magic.")
+
         args = self._parse_slurm_exec_args(line)
-        if args.output_var is not None and not args.output_var.isidentifier():
-            raise UsageError("Output variable name must be a valid Python identifier.")
+        capture_all_inputs = args.inputs is None or len(args.inputs) == 0 or (args.inputs[0] == '*')
+        capture_all_outputs = args.outputs is None or len(args.outputs) == 0 or (args.outputs[0] == '*')
 
-        if args.output_var is None and args.inputs:
-            raise UsageError(
-                "Specify an output variable before listing input variables."
-            )
-        
-        if args.output_var is None and (args.inputs is None or len(args.inputs) == 0):
-            capture_all = True
-        else:
-            capture_all = False
-
-        if capture_all:
+        if capture_all_inputs:
             inputs = self._collect_all_user_variables()
         else:
-            if args.output_var is None:
-                raise UsageError("Output variable name must be provided.")
-            if args.inputs is None or len(args.inputs) == 0:
-                print("WARNING: No input variables specified")
             inputs = self._collect_input_variables(args.inputs)
+
         payload = self._build_slurm_exec_payload(
-            output_var=args.output_var,
-            inputs=inputs,
-            cell=cell,
-            capture_all=capture_all,
+            outputs = args.outputs,
+            inputs = inputs,
+            cell = cell,
+            capture_all_outputs = capture_all_outputs
         )
-        job_dir, job_label = self._create_job_directory(args.job_name)
+        job_dir, job_label = self._create_job_directory(args.sbatch_params.job_name)
         payload_path = job_dir / "payload.pkl"
         self._write_payload(payload_path, payload)
         driver_path = self._write_driver_script(job_dir)
+        sbatch_params = args.sbatch_params
 
         submit_path = self._write_submit_script(
             job_dir=job_dir,
             driver_path=driver_path,
             job_label=job_label,
             python_executable=args.python_executable,
-            partition=args.partition,
-            gpus=args.gpus,
-            time_limit=args.time,
-            qos=args.qos,
-            account=args.account,
-            ntasks=args.ntasks,
-            cpus_per_task=args.cpus_per_task,
+            sbatch_params=sbatch_params,
             modules=args.modules,
-            sbatch_directives=args.sbatch_directives,
+            modules_purge=args.modules_purge,
+            # sbatch_directives=args.sbatch_directives,
         )
 
-        metadata = {
-            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
-            "job_label": job_label,
-            "job_dir": str(job_dir),
-            "inputs": list(inputs.keys()),
-            "output_var": args.output_var,
-            "python_executable": args.python_executable,
-            "partition": args.partition,
-            "gpus": args.gpus,
-            "time_limit": args.time,
-            "qos": args.qos,
-            "account": args.account,
-            "ntasks": args.ntasks,
-            "cpus_per_task": args.cpus_per_task,
-            "modules": args.modules,
-            "capture_all": capture_all,
-        }
-        metadata_path = job_dir / "metadata.json"
-        with open(metadata_path, "w") as handle:
-            json.dump(metadata, handle, indent=2, sort_keys=True)
-
         job_id = self._submit_job(submit_path)
-        metadata["job_id"] = job_id
-        with open(metadata_path, "w") as handle:
-            json.dump(metadata, handle, indent=2, sort_keys=True)
 
-        print("Submitted Slurm job {job} (folder: {folder})".format(
-                  job=job_id, folder=job_dir))
+        print("Submitted Slurm job {job} (folder: {folder})".format(job=job_id, folder=job_dir.relative_to(Path.cwd())))
 
         status = self._wait_for_job_completion(
             job_id=job_id,
@@ -166,52 +119,39 @@ class IPySlurmExec(Magics):
         with open(output_path, "rb") as handle:
             result_payload = pickle.load(handle)
 
-        mode = result_payload.get("mode", "single")
-        if mode == "namespace":
-            raw_namespace = result_payload.get("namespace", {})
-            namespace_update = {}
-            local_errors = {}
-            for name, value in raw_namespace.items():
-                if isinstance(value, bytes):
-                    try:
-                        namespace_update[name] = pickle.loads(value)
-                    except Exception as exc:
-                        local_errors[name] = str(exc)
-                else:
-                    namespace_update[name] = value
-            remote_errors = result_payload.get("errors", {}) or {}
-            if namespace_update:
-                self.shell.push(namespace_update)
-            updated_names = sorted(namespace_update.keys())
-            if len(updated_names) > 8:
-                display_names = ", ".join(updated_names[:8]) + ", …"
+        raw_namespace = result_payload.get("namespace", {})
+        namespace_update = {}
+        local_errors = {}
+        for name, value in raw_namespace.items():
+            if isinstance(value, bytes):
+                try:
+                    namespace_update[name] = pickle.loads(value)
+                except Exception as exc:
+                    local_errors[name] = str(exc)
             else:
-                display_names = ", ".join(updated_names) if updated_names else "<none>"
-            print("Job {job} completed. Updated variables: {names}".format(
-                    job=job_id, names=display_names)
-            )
-            if remote_errors:
-                print("Skipped variables on worker (serialization failed):")
-                for name in sorted(remote_errors.keys()):
-                    print("  {var}: '{err}'".format(var=name, err=remote_errors[name]))
-            if local_errors:
-                print("Skipped variables on host (deserialization failed):")
-                for name in sorted(local_errors.keys()):
-                    print("  {var}: '{err}'".format(var=name, err=local_errors[name]))
-            if capture_all:
-                # return nothing stops everything being printed
-                return None
-            return namespace_update
+                namespace_update[name] = value
+        remote_errors = result_payload.get("errors", {}) or {}
+        if namespace_update:
+            self.shell.push(namespace_update)
+        updated_names = sorted(namespace_update.keys())
+        if len(updated_names) > 8:
+            display_names = ", ".join(updated_names[:8]) + ", …"
         else:
-            result_value = result_payload.get("value")
-            self.shell.push({args.output_var: result_value})
-            print("Job {job} completed. Result assigned to '{var}'".format(
-                    job=job_id, var=args.output_var)
-            )
-            if capture_all:
-                # return nothing stops everything being printed
-                return None
-            return result_value
+            display_names = ", ".join(updated_names) if updated_names else "<none>"
+        print("Job completed")
+        print(f"Updated variables: {display_names}")
+        if remote_errors:
+            print("Skipped variables in Slurm job:")
+            for name in sorted(remote_errors.keys()):
+                print("  {var}: '{err}'".format(var=name, err=remote_errors[name]))
+        if local_errors:
+            print("Skipped variables in Notebook:")
+            for name in sorted(local_errors.keys()):
+                print("  {var}: '{err}'".format(var=name, err=local_errors[name]))
+        if capture_all_outputs:
+            # avoid printing everything
+            return None
+        return namespace_update
 
     def _parse_slurm_exec_args(self, line):
         parser = argparse.ArgumentParser(
@@ -224,33 +164,75 @@ class IPySlurmExec(Magics):
             help=("Optionally provide an output variable followed by the names of"
                   " notebook variables to send to the Slurm job."),
         )
+        parser.add_argument("--python", dest="python_executable", default=sys.executable, help="Python interpreter to use on the Slurm node.")
+
+        parser.add_argument('-i', "--inputs", action="append", default=[], help="Variables to export to Slurm job. Default = everything.")
+        parser.add_argument('-o', "--outputs", action="append", default=[], help="Variables to import into Notebook. Default = everything.")
+
         parser.add_argument("--job-name", dest="job_name", help="Custom Slurm job name.")
-        parser.add_argument("--partition", help="Slurm partition.")
-        parser.add_argument("--gpus", help="Number of GPUs")
-        parser.add_argument("--time", help="Slurm time limit (e.g. 00:10:00).")
-        parser.add_argument("--qos", help="Slurm QoS.")
         parser.add_argument("--account", help="Slurm account.")
+        parser.add_argument("--qos", help="Slurm QoS.")
+        parser.add_argument("--partition", help="Slurm partition.")
+        parser.add_argument("--time", help="Slurm time limit (e.g. 00:10:00).")
         parser.add_argument("--ntasks", type=int, default=None, help="Number of tasks for the Slurm job.")
         parser.add_argument("--cpus-per-task", dest="cpus_per_task", type=int, default=None, help="CPUs per task for the Slurm job.")
+        parser.add_argument("--mem", help="Memory")
+        parser.add_argument("--gpus", help="Number of GPUs")
+        # parser.add_argument("--sbatch", dest="sbatch_directives", action="append", default=[], help="Additional SBATCH directives, e.g. --sbatch='--gres=gpu:1'.")
+
         parser.add_argument("--modules", action="append", default=[], help="Environment modules to load before execution (repeatable, accepts comma separation).")
-        parser.add_argument("--python", dest="python_executable", default=sys.executable, help="Python interpreter to use on the Slurm node.")
-        parser.add_argument("--sbatch", dest="sbatch_directives", action="append", default=[], help="Additional SBATCH directives, e.g. --sbatch='--gres=gpu:1'.")
+        
         parser.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between status checks.")
         parser.add_argument("--max-wait", type=float, default=None, help="Maximum seconds to wait for completion (default: unlimited).")
-        try:
-            args = parser.parse_args(shlex.split(line))
-        except SystemExit as exc:
-            raise UsageError("Invalid arguments for %slurm_exec") from exc
-        args.modules = self._normalize_module_list(args.modules)
-        positional = list(args.variables)
-        if positional:
-            args.output_var = positional[0]
-            args.inputs = positional[1:]
+        args = parser.parse_args(shlex.split(line))
+        
+        modules = args.modules
+        if len(modules) > 0 and modules[0][0] == '+':
+            purge = False
+            if modules[0] == '+':
+                del modules[0]
+            else:
+                modules[0] = modules[0][1:]
         else:
-            args.output_var = None
-            args.inputs = []
-        delattr(args, "variables")
-        return args
+            purge = True
+        
+        def _norm_csv_list(x):
+            y = []
+            for entry in x:
+                for raw in entry.split(","):
+                    module = raw.strip()
+                    if module:
+                        y.append(module)
+            return y
+        args.modules = _norm_csv_list(modules)
+        args.modules_purge = purge
+    
+        args.inputs = _norm_csv_list(args.inputs)
+        args.outputs = _norm_csv_list(args.outputs)
+
+        args.sbatch_params = SBatch(
+            account=args.account,
+            qos=args.qos,
+            job_name=args.job_name,
+            partition=args.partition,
+            time_limit=args.time,
+            ntasks=args.ntasks,
+            cpus_per_task=args.cpus_per_task,
+            gpus=args.gpus,
+            mem=args.mem
+        )
+
+        return NotebookJob(
+            python_executable = args.python_executable,
+            sbatch_params = args.sbatch_params,
+            modules = args.modules,
+            modules_purge = args.modules_purge,
+
+            inputs = args.inputs,
+            outputs = args.outputs,
+            poll_interval = args.poll_interval,
+            max_wait = args.max_wait
+        )
 
     def _collect_input_variables(self, input_names):
         variables = {}
@@ -278,16 +260,7 @@ class IPySlurmExec(Magics):
             variables[name] = value
         return variables
 
-    def _normalize_module_list(self, modules):
-        normalized = []
-        for entry in modules:
-            for raw in entry.split(","):
-                module = raw.strip()
-                if module:
-                    normalized.append(module)
-        return normalized
-
-    def _build_slurm_exec_payload(self, output_var, inputs, cell, capture_all):
+    def _build_slurm_exec_payload(self, outputs, inputs, cell, capture_all_outputs):
         module_aliases = {}
         for alias, value in self.shell.user_ns.items():
             if isinstance(value, types.ModuleType):
@@ -297,27 +270,26 @@ class IPySlurmExec(Magics):
                 module_aliases[alias] = module_name
 
         payload = {
-            "output_var": output_var,
+            "outputs": outputs,
             "variables": inputs,
             "modules": module_aliases,
             "sys_path": list(sys.path),
             "cell": cell,
             "pickle_protocol": pickle.HIGHEST_PROTOCOL,
-            "capture_all": capture_all,
+            "capture_all_outputs": capture_all_outputs,
         }
         return payload
 
-    def _create_job_directory(self, requested_name):
-        base = requested_name or "slurm-exec"
+    def _create_job_directory(self, requested_name=''):
+        base = requested_name or ''
         base = re.sub(r"[^A-Za-z0-9._-]", "-", base).strip("-")
-        if not base:
-            base = "slurm-exec"
-        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        base64 = base[:64]
+        if base != '':
+            base += '-'
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M")
         token = uuid.uuid4().hex[:8]
-        job_label = "{base}-{token}".format(base=base[:64], token=token)
-        job_dir = self._jobs_root / "{base}-{timestamp}-{token}".format(
-            base=base, timestamp=timestamp, token=token
-        )
+        job_label = f"{base64}{token}"
+        job_dir = self._jobs_root / f"{base}{timestamp}-{token}"
         job_dir.mkdir(parents=True, exist_ok=False)
         return job_dir, job_label[:100]
 
@@ -364,43 +336,38 @@ class IPySlurmExec(Magics):
                             continue
                         namespace[alias] = module
                     exec(payload["cell"], namespace)
-                    if payload.get("capture_all", False):
-                        namespace_payload = {}
-                        namespace_errors = {}
+                    if payload.get("capture_all_outputs", False):
+                        vars_to_capture = []
                         for name, value in namespace.items():
                             if name == "__builtins__":
                                 continue
                             if isinstance(value, types.ModuleType):
                                 continue
-                            try:
-                                namespace_payload[name] = pickle.dumps(
-                                    value, protocol=payload["pickle_protocol"]
-                                )
-                            except Exception as exc:
-                                namespace_errors[name] = repr(exc)
-                        with open(OUTPUT_FILE, "wb") as handle:
-                            pickle.dump(
-                                {
-                                    "mode": "namespace",
-                                    "namespace": namespace_payload,
-                                    "errors": namespace_errors,
-                                },
-                                handle,
-                                protocol=payload["pickle_protocol"],
-                            )
+                            vars_to_capture.append(name)
                     else:
-                        result_var = payload["output_var"]
-                        if result_var not in namespace:
-                            raise RuntimeError(
-                                "Result variable '{var}' was not defined by the job.".format(
-                                    var=result_var
-                                )
+                        vars_to_capture = payload["outputs"]
+                        for name in vars_to_capture:
+                            if name not in namespace:
+                                raise RuntimeError("Result variable '{var}' was not defined by the job.".format(var=name))
+                    
+                    namespace_payload = {}
+                    namespace_errors = {}
+                    for name in vars_to_capture:
+                        value = namespace[name]
+                        try:
+                            namespace_payload[name] = pickle.dumps(
+                                value, protocol=payload["pickle_protocol"]
                             )
-                        with open(OUTPUT_FILE, "wb") as handle:
-                            pickle.dump(
-                                {"mode": "single", "value": namespace[result_var]},
-                                handle,
-                                protocol=payload["pickle_protocol"],
+                        except Exception as exc:
+                            namespace_errors[name] = repr(exc)
+                    with open(OUTPUT_FILE, "wb") as handle:
+                        pickle.dump(
+                            {
+                                "namespace": namespace_payload,
+                                "errors": namespace_errors,
+                            },
+                            handle,
+                            protocol=payload["pickle_protocol"],
                             )
                     status = {"state": "COMPLETED"}
                 except Exception as exc:
@@ -429,47 +396,44 @@ class IPySlurmExec(Magics):
         self,
         job_dir,
         driver_path,
-        job_label,
         python_executable,
-        partition,
-        gpus,
-        time_limit,
-        qos,
-        account,
-        ntasks,
-        cpus_per_task,
+        job_label,
+        sbatch_params,
+        # sbatch_directives,
         modules,
-        sbatch_directives,
+        modules_purge,
     ):
         submit_path = job_dir / "submit.sh"
         lines = ["#!/bin/bash", "#SBATCH --export=ALL", "#SBATCH --chdir={}".format(job_dir)]
         lines.append("#SBATCH --job-name={}".format(job_label))
         lines.append("#SBATCH --output={}".format(job_dir / "slurm-%j.out"))
         lines.append("#SBATCH --error={}".format(job_dir / "slurm-%j.err"))
-        if partition:
-            lines.append("#SBATCH --partition={}".format(partition))
-        if gpus:
-            lines.append("#SBATCH --gpus={}".format(gpus))
-        if time_limit:
-            lines.append("#SBATCH --time={}".format(time_limit))
-        if qos:
-            lines.append("#SBATCH --qos={}".format(qos))
-        if account:
-            lines.append("#SBATCH --account={}".format(account))
-        if ntasks:
-            lines.append("#SBATCH --ntasks={}".format(ntasks))
-        if cpus_per_task:
-            lines.append("#SBATCH --cpus-per-task={}".format(cpus_per_task))
-        for directive in sbatch_directives:
-            lines.append("#SBATCH {}".format(directive))
+        if sbatch_params.account:
+            lines.append("#SBATCH --account={}".format(sbatch_params.account))
+        if sbatch_params.qos:
+            lines.append("#SBATCH --qos={}".format(sbatch_params.qos))
+        if sbatch_params.partition:
+            lines.append("#SBATCH --partition={}".format(sbatch_params.partition))
+        if sbatch_params.time_limit:
+            lines.append("#SBATCH --time={}".format(sbatch_params.time_limit))
+        if sbatch_params.ntasks:
+            lines.append("#SBATCH --ntasks={}".format(sbatch_params.ntasks))
+        if sbatch_params.cpus_per_task:
+            lines.append("#SBATCH --cpus-per-task={}".format(sbatch_params.cpus_per_task))
+        if sbatch_params.mem:
+            lines.append("#SBATCH --mem={}".format(sbatch_params.mem))
+        if sbatch_params.gpus:
+            lines.append("#SBATCH --gpus={}".format(sbatch_params.gpus))
+        # for directive in sbatch_directives:
+        #     lines.append("#SBATCH {}".format(directive))
 
         lines.append("")
         if modules:
-            lines.append("module purge || true")
+            if modules_purge:
+                lines.append("module purge || true")
             for module in modules:
                 lines.append("module load {}".format(module))
 
-        # driver_path_relative = str(driver_path).replace(str(job_dir)+'/', './')
         driver_path_relative = driver_path.relative_to(job_dir)
         command = "exec {python} {driver}".format(
             python=shlex.quote(python_executable), driver=shlex.quote(str(driver_path_relative))
