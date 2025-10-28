@@ -1,3 +1,6 @@
+# © 2025 The Chancellor, Masters and Scholars of the University of Oxford
+# Licensed for internal use only within the CCB HPC facility, WIMM, University of Oxford.
+
 from __future__ import print_function
 
 import argparse

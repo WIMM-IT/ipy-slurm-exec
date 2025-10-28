@@ -9,8 +9,10 @@ setup(
     long_description_content_type="text/markdown",
     long_description=README,
     name="ipy-slurm-exec",
+    license="Proprietary",
+    license_files=["LICENSE.txt"],
     py_modules=["ipy_slurm_exec"],
     install_requires=["ipython"],
     url="https://github.com/WIMM-IT/ipy-slurm-exec",
-    version="1.0",
+    version="0.1",
 )

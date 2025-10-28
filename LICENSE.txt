@@ -1,0 +1,20 @@
+Copyright © 2025 The Chancellor, Masters and Scholars of the University of Oxford.
+All rights reserved.
+
+1. Scope of Use
+This software ("Software") is made available by the University of Oxford ("Licensor") for use solely within the Computational Biology Cluster (CCB HPC facility) at the Weatherall Institute of Molecular Medicine (WIMM), University of Oxford. Authorised users ("Licensees") may run and use the Software for research and educational purposes directly related to their work on this facility.
+
+2. Restrictions
+Licensees must not: copy, download, transfer, or distribute the Software (or any part thereof) outside the CCB HPC facility; make the Software available to any person or organisation not authorised to use the CCB HPC facility; publish, post, or otherwise disseminate the Software, its source code, or any derivatives; modify, decompile, or reverse engineer the Software except with the prior written consent of the Licensor.
+
+3. Intellectual Property
+All rights, title, and interest in and to the Software, including all intellectual property rights, remain the exclusive property of the University of Oxford. This License grants no ownership rights and no right of distribution beyond those expressly stated herein.
+
+4. Disclaimer
+The Software is provided "as is," without warranty of any kind, express or implied. The Licensor shall not be liable for any loss or damage arising from its use.
+
+5. Termination
+Permission to use the Software terminates immediately upon any breach of these terms. Upon termination, Licensees must cease using and delete all copies within their control.
+
+6. Governing Law
+This License shall be governed by and construed in accordance with the laws of England and Wales.
