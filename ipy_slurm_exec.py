@@ -142,7 +142,7 @@ class IPySlurmExec(Magics):
         else:
             display_names = ", ".join(updated_names) if updated_names else "<none>"
         print("Job completed")
-        print(f"Updated variables: {display_names}")
+        print(f"Imported variables: {display_names}")
         if remote_errors:
             print("Skipped variables in Slurm job:")
             for name in sorted(remote_errors.keys()):
