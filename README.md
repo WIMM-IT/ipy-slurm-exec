@@ -11,19 +11,18 @@ data = np.arange(12).reshape(3, 4)
 scale = 2.5
 ```
 
-Use `%%slurm_exec` cell magic to setup code to run Slurm cluster (default queue and resources):
+Use `%%slurm_exec` cell magic to specify code to run in a Slurm cluster job:
 ```
 %%slurm_exec
-import numpy as np
 scaled = np.asarray(data) * scale
 reduced = scaled.sum(axis=0)
 ```
 
 Execution report:
 ```
-Submitted Slurm job 4394414 (folder: slurm_exec/20251028T1620-4377f370)
+Submitted Slurm job ...
 Job completed                                                                   
-Updated variables: data, params, reduced, scaled
+Updated variables: data, reduced, scale, scaled
 ```
 
 Print result in Notebook:
@@ -34,16 +33,15 @@ print(reduced)
 
 ## `slurm_exec` arguments:
 
-Specify arguments after `%%slurm_exec` to manage variables and the Slurm job.
+Specify arguments with `%%slurm_exec` to manage variables and the Slurm job.
 
 ### Managing variables
 
 If you do not specify a list of variables to export, then all are exported to the Slurm job.
 Similarly for importing after the job finishes.
-For small notebooks this probably does not matter, 
-but for large notebooks this may cause problems - 
+For large notebooks this may cause problems - 
 overwriting a variable in another part of your notebook, or exporting many big variables that are never used (wasting memory).
-So use these arguments to manage.
+Use these arguments to manage.
 
 ```
 -i, --inputs: list of variables to input into the Slurm job
@@ -57,13 +55,10 @@ e.g. %%slurm_exec -i data,scale ...
 e.g. %%slurm_exec -o reduced ...
 ```
 
-In a large or complex Notebook, you probably want to carefully manage which variables are exported and imported. 
-
 #### Import fail
 
-When you do not specify `-o` argument, then `slurm_exec` will attempt to import all variables from the Slurm job. 
-However some may be dependent on additional modules loaded by job that were not loaded by your Notebook, for example CUDA, so cannot be imported.
-The execution report will list variables that could not be imported with reason why, e.g.:
+Python variables created in the Slurm job may be dependent on additional modules it loaded that were not loaded by your Notebook, for example CUDA.
+These cannot be imported into Notebook so will be skipped - the execution report will list when this happens e.g.:
 
 ```
 Skipped variables in Notebook:
@@ -72,6 +67,9 @@ Skipped variables in Notebook:
 
 
 ### Slurm job parameters
+
+Refer to any Slurm cluster documentation for setting these parameters, as the values are simply passed to Slurm.
+When not set then Slurm defaults are used, same as when directly submitting a job to Slurm.
 
 ```
 --partition
@@ -83,8 +81,6 @@ Skipped variables in Notebook:
 
 e.g. %%slurm_exec --partition=gpu --gpus=1 --time=00:10:00
 ```
-
-Refer to any Slurm cluster documentation for setting these parameters, as the values are simply passed to Slurm.
 
 ### GNU environment modules
 
@@ -114,7 +110,7 @@ gpu_result = cp.asnumpy(device_vec ** 2)
 
 Execution report:
 ```
-Submitted Slurm job 4394748 (folder: slurm_exec/20251028T1650-e3c49805)
+Submitted Slurm job ...
 Job completed                                                                   
 Updated variables: gpu_result
 {'gpu_result': array([ 0.,  1.,  4.,  9., 16., 25., 36., 49., 64., 81.])}
