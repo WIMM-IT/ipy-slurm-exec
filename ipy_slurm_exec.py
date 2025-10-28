@@ -69,22 +69,24 @@ class IPySlurmExec(Magics):
         if args.output_var is not None and not args.output_var.isidentifier():
             raise UsageError("Output variable name must be a valid Python identifier.")
 
-        # Disable capture-all variables, some issues to iron-out.
-        # Until then, user must specify variables.
-        capture_all = False
-
         if args.output_var is None and args.inputs:
             raise UsageError(
                 "Specify an output variable before listing input variables."
             )
+        
+        if args.output_var is None and (args.inputs is None or len(args.inputs) == 0):
+            capture_all = True
+        else:
+            capture_all = False
 
         if capture_all:
             inputs = self._collect_all_user_variables()
         else:
             if args.output_var is None:
                 raise UsageError("Output variable name must be provided.")
+            if args.inputs is None or len(args.inputs) == 0:
+                print("WARNING: No input variables specified")
             inputs = self._collect_input_variables(args.inputs)
-        inputs = self._collect_input_variables(args.inputs)
         payload = self._build_slurm_exec_payload(
             output_var=args.output_var,
             inputs=inputs,
@@ -166,7 +168,18 @@ class IPySlurmExec(Magics):
 
         mode = result_payload.get("mode", "single")
         if mode == "namespace":
-            namespace_update = result_payload.get("namespace", {})
+            raw_namespace = result_payload.get("namespace", {})
+            namespace_update = {}
+            local_errors = {}
+            for name, value in raw_namespace.items():
+                if isinstance(value, bytes):
+                    try:
+                        namespace_update[name] = pickle.loads(value)
+                    except Exception as exc:
+                        local_errors[name] = str(exc)
+                else:
+                    namespace_update[name] = value
+            remote_errors = result_payload.get("errors", {}) or {}
             if namespace_update:
                 self.shell.push(namespace_update)
             updated_names = sorted(namespace_update.keys())
@@ -175,9 +188,19 @@ class IPySlurmExec(Magics):
             else:
                 display_names = ", ".join(updated_names) if updated_names else "<none>"
             print("Job {job} completed. Updated variables: {names}".format(
-                    job=job_id,
-                    names=display_names)
+                    job=job_id, names=display_names)
             )
+            if remote_errors:
+                print("Skipped variables on worker (serialization failed):")
+                for name in sorted(remote_errors.keys()):
+                    print("  {var}: '{err}'".format(var=name, err=remote_errors[name]))
+            if local_errors:
+                print("Skipped variables on host (deserialization failed):")
+                for name in sorted(local_errors.keys()):
+                    print("  {var}: '{err}'".format(var=name, err=local_errors[name]))
+            if capture_all:
+                # return nothing stops everything being printed
+                return None
             return namespace_update
         else:
             result_value = result_payload.get("value")
@@ -185,6 +208,9 @@ class IPySlurmExec(Magics):
             print("Job {job} completed. Result assigned to '{var}'".format(
                     job=job_id, var=args.output_var)
             )
+            if capture_all:
+                # return nothing stops everything being printed
+                return None
             return result_value
 
     def _parse_slurm_exec_args(self, line):
@@ -340,15 +366,25 @@ class IPySlurmExec(Magics):
                     exec(payload["cell"], namespace)
                     if payload.get("capture_all", False):
                         namespace_payload = {}
+                        namespace_errors = {}
                         for name, value in namespace.items():
                             if name == "__builtins__":
                                 continue
                             if isinstance(value, types.ModuleType):
                                 continue
-                            namespace_payload[name] = value
+                            try:
+                                namespace_payload[name] = pickle.dumps(
+                                    value, protocol=payload["pickle_protocol"]
+                                )
+                            except Exception as exc:
+                                namespace_errors[name] = repr(exc)
                         with open(OUTPUT_FILE, "wb") as handle:
                             pickle.dump(
-                                {"mode": "namespace", "namespace": namespace_payload},
+                                {
+                                    "mode": "namespace",
+                                    "namespace": namespace_payload,
+                                    "errors": namespace_errors,
+                                },
                                 handle,
                                 protocol=payload["pickle_protocol"],
                             )
