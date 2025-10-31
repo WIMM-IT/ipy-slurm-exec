@@ -56,6 +56,7 @@ class IPySlurmExec(Magics):
         super(IPySlurmExec, self).__init__(shell, **kwargs)
         self._jobs_root = Path.cwd() / "slurm_exec"
         self._jobs_root.mkdir(parents=True, exist_ok=True)
+        self._warned_reportseff_missing = False
 
     @line_cell_magic
     def slurm_exec(self, line, cell=None):
@@ -153,7 +154,10 @@ class IPySlurmExec(Magics):
                 print("  {var}: '{err}'".format(var=name, err=local_errors[name]))
         if capture_all_outputs:
             # avoid printing everything
-            return None
+            namespace_update = None
+        
+        self._report_job_efficiency(job_id, status.get("state"))
+
         return namespace_update
 
     def _parse_slurm_exec_args(self, line):
@@ -329,6 +333,8 @@ class IPySlurmExec(Magics):
                 try:
                     with open(PAYLOAD_FILE, "rb") as handle:
                         payload = pickle.load(handle)
+
+                    # Load imports and variables
                     sys.path = payload["sys_path"]
                     namespace = {}
                     namespace.update(payload["variables"])
@@ -338,7 +344,11 @@ class IPySlurmExec(Magics):
                         except Exception:
                             continue
                         namespace[alias] = module
+
+                    # Execute
                     exec(payload["cell"], namespace)
+
+                    # Extract output variables
                     if payload.get("capture_all_outputs", False):
                         vars_to_capture = []
                         for name, value in namespace.items():
@@ -352,7 +362,6 @@ class IPySlurmExec(Magics):
                         for name in vars_to_capture:
                             if name not in namespace:
                                 raise RuntimeError("Result variable '{var}' was not defined by the job.".format(var=name))
-                    
                     namespace_payload = {}
                     namespace_errors = {}
                     for name in vars_to_capture:
@@ -363,6 +372,8 @@ class IPySlurmExec(Magics):
                             )
                         except Exception as exc:
                             namespace_errors[name] = repr(exc)
+
+                    # Write to pickle file
                     with open(OUTPUT_FILE, "wb") as handle:
                         pickle.dump(
                             {
@@ -551,6 +562,68 @@ class IPySlurmExec(Magics):
         sys.stdout.write("\r" + " " * 80 + "\r")
         sys.stdout.flush()
 
+    def _report_job_efficiency(self, job_id, final_state):
+        if not self._command_available("reportseff"):
+            if not self._warned_reportseff_missing:
+                print("Skipping resource efficiency report: 'reportseff' command not found.")
+                self._warned_reportseff_missing = True
+            return
+        
+        time.sleep(1)  # Give Slurm a moment to update
+        nrepeats = 3
+        while nrepeats > 0:
+            # Can take a few seconds for Slurm accounting to update.
+            # For every short jobs, don't ever expect a value for CPU use.
+            process = Popen(["reportseff", str(job_id)], stdout=PIPE, stderr=PIPE)
+            stdout, stderr = process.communicate()
+            cmd = ' '.join(["reportseff", str(job_id)])
+            # print(f"# cmd = {cmd}")
+            # print("# reportseff raw output:") ; print(stdout)
+            if process.returncode != 0:
+                error_message = stderr.decode("utf-8", "ignore").strip()
+                if error_message:
+                    print("Failed to collect resource efficiency (reportseff): {err}".format(err=error_message))
+                else:
+                    print("Failed to collect resource efficiency: reportseff exited with code {code}".format(code=process.returncode))
+                return
+            output_text = stdout.decode("utf-8", "ignore")
+            output_text = output_text.rstrip()
+            parsed = self._parse_reportseff_output(output_text)
+            # print("# parsed:") ; print(parsed)
+            if parsed['Elapsed'] != '---' and parsed['MemEff'] != '---':
+                break
+                nrepeats -= 1
+            time.sleep(1)
+
+        # state_note = " ({})".format(final_state) if final_state else ""
+        # print("Resource efficiency (reportseff{note}):".format(note=state_note))
+        print("Resource efficiency:")
+        # if output_text:
+        print(output_text)
+        # values = []
+        # cpu_eff = parsed.get("CPUEff") or parsed.get("AveCPU")
+        # mem_eff = parsed.get("MemEff") or parsed.get("MaxRSS")
+        # if cpu_eff:
+        #     values.append("CPUEff {value}".format(value=cpu_eff))
+        # if mem_eff:
+        #     values.append("MemEff {value}".format(value=mem_eff))
+        # if values:
+        #     print("  " + ", ".join(values))
+
+    def _parse_reportseff_output(self, output_text):
+        lines = [line for line in output_text.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return {}
+        header = self._strip_ansi_codes(lines[0]).split()
+        for raw_line in lines[1:]:
+            data = self._strip_ansi_codes(raw_line).split()
+            if len(header) == len(data):
+                return dict(zip(header, data))
+        return {}
+
+    def _strip_ansi_codes(self, text):
+        ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+        return ansi_escape.sub("", text)
 
 def load_ipython_extension(ip):
     """Load extension in IPython."""
