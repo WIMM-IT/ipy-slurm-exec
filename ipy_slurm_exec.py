@@ -23,6 +23,7 @@ from typing import Optional, Required
 
 from IPython.core.error import UsageError
 from IPython.core.magic import Magics, line_cell_magic, line_magic, magics_class
+from IPython.display import HTML, display
 
 
 @dataclass
@@ -109,7 +110,29 @@ class IPySlurmExec(Magics):
 
         if status.get("state") != "COMPLETED":
             message = status.get("message", "Slurm job did not complete successfully.")
-            raise RuntimeError("Job {job} failed ({state}). See {folder} for details.\n{message}".format(
+            trace_text = None
+            trace_path = job_dir / "traceback.log"
+            if trace_path.exists():
+                try:
+                    trace_text = trace_path.read_text(errors="replace")
+                except Exception:
+                    trace_text = None
+                if trace_text:
+                    # Expose traceback to the notebook namespace for inspection.
+                    self.shell.push({"_slurm_remote_traceback": trace_text})
+                    # Render a coloured traceback if pygments is available.
+                    try:
+                        from pygments import highlight
+                        from pygments.formatters import HtmlFormatter
+                        from pygments.lexers import PythonTracebackLexer
+                        formatter = HtmlFormatter(noclasses=True)
+                        html = highlight(trace_text, PythonTracebackLexer(), formatter)
+                        display(HTML(f"<div style='font-family: monospace'>{html}</div>"))
+                    except Exception:
+                        pass
+                    # Override message to avoid duplicating the remote error text.
+                    message = ''
+            raise RuntimeError("slurm_exec job {job} is {state}. Traceback should be printed above. Job files stored in folder: {folder}.\n{message}".format(
                                     job=job_id,
                                     state=status.get("state"),
                                     folder=job_dir,
@@ -484,6 +507,8 @@ class IPySlurmExec(Magics):
         status_path = job_dir / "status.json"
         start_time = time.time()
         last_state = None
+
+        curr_interval = poll_interval
         while True:
             if status_path.exists():
                 with open(status_path, "r") as handle:
@@ -494,7 +519,9 @@ class IPySlurmExec(Magics):
                         return result
                     except json.JSONDecodeError:
                         pass
-            if max_wait is not None and (time.time() - start_time) > max_wait:
+
+            secs_since_start = time.time() - start_time
+            if max_wait is not None and secs_since_start > max_wait:
                 if last_state is not None:
                     self._clear_status_line()
                 raise RuntimeError(
@@ -523,7 +550,16 @@ class IPySlurmExec(Magics):
                 )
                 self._write_status_line(message)
                 last_state = state
-            time.sleep(poll_interval)
+            
+            # Increase poll interval with time
+            if secs_since_start > 60:
+                curr_interval = max(10, poll_interval)
+            elif secs_since_start > 30:
+                curr_interval = max(5, poll_interval)
+            elif secs_since_start > 10:
+                curr_interval = max(2, poll_interval)
+
+            time.sleep(curr_interval)
 
     def _job_active(self, job_id):
         if not self._command_available("squeue"):
