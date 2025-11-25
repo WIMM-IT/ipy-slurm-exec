@@ -349,6 +349,7 @@ class IPySlurmExec(Magics):
             STATUS_FILE = JOB_DIR / "status.json"
             OUTPUT_FILE = JOB_DIR / "output.pkl"
             TRACEBACK_FILE = JOB_DIR / "traceback.log"
+            CELL_FILE = JOB_DIR / "cell.py"
 
             def main():
                 exit_code = 0
@@ -369,7 +370,13 @@ class IPySlurmExec(Magics):
                         namespace[alias] = module
 
                     # Execute
-                    exec(payload["cell"], namespace)
+                    cell_source = payload["cell"]
+                    try:
+                        CELL_FILE.write_text(cell_source)
+                    except Exception:
+                        pass
+                    code_obj = compile(cell_source, str(CELL_FILE), "exec")
+                    exec(code_obj, namespace)
 
                     # Extract output variables
                     if payload.get("capture_all_outputs", False):
@@ -410,9 +417,16 @@ class IPySlurmExec(Magics):
                 except Exception as exc:
                     exit_code = 1
                     status = {"state": "FAILED", "message": str(exc)}
-                    traceback.print_exc()
+                    trimmed_tb = exc.__traceback__
+                    driver_path = str(Path(__file__).resolve())
+                    # Only drop the driver frame if the next frame refers to the cell code.
+                    if trimmed_tb and trimmed_tb.tb_frame and str(trimmed_tb.tb_frame.f_code.co_filename) == driver_path:
+                        next_tb = trimmed_tb.tb_next
+                        if next_tb and str(next_tb.tb_frame.f_code.co_filename) == str(CELL_FILE):
+                            trimmed_tb = next_tb
+                    traceback.print_exception(type(exc), exc, trimmed_tb)
                     with open(TRACEBACK_FILE, "w") as trace_handle:
-                        traceback.print_exc(file=trace_handle)
+                        traceback.print_exception(type(exc), exc, trimmed_tb, file=trace_handle)
                 finally:
                     with open(STATUS_FILE, "w") as status_handle:
                         json.dump(status, status_handle)

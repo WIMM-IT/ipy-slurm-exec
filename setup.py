@@ -14,5 +14,5 @@ setup(
     py_modules=["ipy_slurm_exec"],
     install_requires=["ipython"],
     url="https://github.com/WIMM-IT/ipy-slurm-exec",
-    version="0.3",
+    version="0.3.1",
 )
