@@ -24,6 +24,7 @@ from typing import Optional, Required
 from IPython.core.error import UsageError
 from IPython.core.magic import Magics, line_cell_magic, line_magic, magics_class
 from IPython.display import HTML, display
+from ipy_slurm_exec_runtime import serialize_variable, restore_from_record
 
 
 @dataclass
@@ -74,13 +75,15 @@ class IPySlurmExec(Magics):
         else:
             inputs = self._collect_input_variables(args.inputs)
 
+        job_dir, job_label = self._create_job_directory(args.sbatch_params.job_name)
+
         payload = self._build_slurm_exec_payload(
             outputs = args.outputs,
             inputs = inputs,
             cell = cell,
-            capture_all_outputs = capture_all_outputs
+            capture_all_outputs = capture_all_outputs,
+            job_dir = job_dir,
         )
-        job_dir, job_label = self._create_job_directory(args.sbatch_params.job_name)
         payload_path = job_dir / "payload.pkl"
         self._write_payload(payload_path, payload)
         driver_path = self._write_driver_script(job_dir)
@@ -150,13 +153,15 @@ class IPySlurmExec(Magics):
         namespace_update = {}
         local_errors = {}
         for name, value in raw_namespace.items():
-            if isinstance(value, bytes):
-                try:
+            try:
+                if isinstance(value, dict) and "mode" in value:
+                    namespace_update[name] = restore_from_record(value, job_dir)
+                elif isinstance(value, bytes):
                     namespace_update[name] = pickle.loads(value)
-                except Exception as exc:
-                    local_errors[name] = str(exc)
-            else:
-                namespace_update[name] = value
+                else:
+                    namespace_update[name] = value
+            except Exception as exc:
+                local_errors[name] = str(exc)
         remote_errors = result_payload.get("errors", {}) or {}
         if namespace_update:
             self.shell.push(namespace_update)
@@ -290,7 +295,7 @@ class IPySlurmExec(Magics):
             variables[name] = value
         return variables
 
-    def _build_slurm_exec_payload(self, outputs, inputs, cell, capture_all_outputs):
+    def _build_slurm_exec_payload(self, outputs, inputs, cell, capture_all_outputs, job_dir):
         module_aliases = {}
         for alias, value in self.shell.user_ns.items():
             if isinstance(value, types.ModuleType):
@@ -299,16 +304,34 @@ class IPySlurmExec(Magics):
                     continue
                 module_aliases[alias] = module_name
 
-        payload = {
+        serialized_vars = {}
+        errors = {}
+        for name, value in inputs.items():
+            try:
+                serialized_vars[name] = serialize_variable(
+                    name=name,
+                    value=value,
+                    root_dir=job_dir,
+                    rel_root="inputs",
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            except Exception as exc:
+                errors[name] = str(exc)
+        if errors:
+            raise UsageError(
+                "Failed to serialize variables for %slurm_exec: "
+                + ", ".join(f"{k}: {v}" for k, v in errors.items())
+            )
+
+        return {
             "outputs": outputs,
-            "variables": inputs,
+            "variables": serialized_vars,
             "modules": module_aliases,
             "sys_path": list(sys.path),
             "cell": cell,
             "pickle_protocol": pickle.HIGHEST_PROTOCOL,
             "capture_all_outputs": capture_all_outputs,
         }
-        return payload
 
     def _create_job_directory(self, requested_name=''):
         base = requested_name or ''
@@ -335,6 +358,10 @@ class IPySlurmExec(Magics):
             )
 
     def _write_driver_script(self, job_dir):
+        helper_src = Path(__file__).with_name("ipy_slurm_exec_runtime.py")
+        helper_dest = job_dir / "ipy_slurm_exec_runtime.py"
+        shutil.copyfile(helper_src, helper_dest)
+
         driver_code = textwrap.dedent(
             """\
             import json
@@ -342,6 +369,7 @@ class IPySlurmExec(Magics):
             import sys
             import traceback
             import types
+            import importlib.util
             from pathlib import Path
 
             JOB_DIR = Path(__file__).resolve().parent
@@ -350,6 +378,11 @@ class IPySlurmExec(Magics):
             OUTPUT_FILE = JOB_DIR / "output.pkl"
             TRACEBACK_FILE = JOB_DIR / "traceback.log"
             CELL_FILE = JOB_DIR / "cell.py"
+
+            HELPER_FILE = JOB_DIR / "ipy_slurm_exec_runtime.py"
+            _spec = importlib.util.spec_from_file_location("ipy_slurm_exec_runtime", HELPER_FILE)
+            _runtime = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_runtime)
 
             def main():
                 exit_code = 0
@@ -361,7 +394,19 @@ class IPySlurmExec(Magics):
                     # Load imports and variables
                     sys.path = payload["sys_path"]
                     namespace = {}
-                    namespace.update(payload["variables"])
+                    namespace_errors = {}
+                    for name, record in payload["variables"].items():
+                        try:
+                            namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
+                        except Exception as exc:
+                            mode = record.get("mode", "unknown")
+                            path = record.get("path")
+                            extra = f", path={path}" if path else ""
+                            trace_text = traceback.format_exc()
+                            namespace_errors[name] = f"{repr(exc)} [mode={mode}{extra}]\\n{trace_text}"
+                    if namespace_errors:
+                        detail = "\\n".join(f"{var}: {err}" for var, err in sorted(namespace_errors.items()))
+                        raise RuntimeError(f"Failed to restore input variables:\\n{detail}")
                     for alias, module_name in payload["modules"].items():
                         try:
                             module = __import__(module_name)
@@ -397,8 +442,12 @@ class IPySlurmExec(Magics):
                     for name in vars_to_capture:
                         value = namespace[name]
                         try:
-                            namespace_payload[name] = pickle.dumps(
-                                value, protocol=payload["pickle_protocol"]
+                            namespace_payload[name] = _runtime.serialize_variable(
+                                name,
+                                value,
+                                root_dir=JOB_DIR,
+                                rel_root="outputs",
+                                protocol=payload["pickle_protocol"],
                             )
                         except Exception as exc:
                             namespace_errors[name] = repr(exc)
@@ -623,7 +672,7 @@ class IPySlurmExec(Magics):
         nrepeats = 3
         while nrepeats > 0:
             # Can take a few seconds for Slurm accounting to update.
-            # For every short jobs, don't ever expect a value for CPU use.
+            # For very-short jobs, don't ever expect a value for CPU use.
             process = Popen(["reportseff", str(job_id)], stdout=PIPE, stderr=PIPE)
             stdout, stderr = process.communicate()
             cmd = ' '.join(["reportseff", str(job_id)])

@@ -1,3 +1,9 @@
+0.4
+Fallback for variables that don't like pickling: 
+use their save() load() functions.
+Only seen with packages scvi / cell2location.
+A little hacky, hopefully I can convince them to improve save/load.
+
 0.3
 Improve job error reporting.
 
