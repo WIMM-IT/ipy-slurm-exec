@@ -571,8 +571,68 @@ class IPySlurmExec(Magics):
 
     def _wait_for_job_completion(self, job_id, job_dir, poll_interval, max_wait):
         status_path = job_dir / "status.json"
+        log_path = job_dir / f"slurm-{job_id}.out"
         start_time = time.time()
         last_state = None
+        last_status_line = None
+        log_offset = 0
+        partial_log_line = ""
+        last_log_line_width = 0
+        last_carriage_line = None
+
+        def _emit(line, carriage=False):
+            nonlocal last_log_line_width, last_carriage_line
+            if line == "":
+                return
+            if carriage:
+                last_log_line_width = max(last_log_line_width, len(line))
+                sys.stdout.write("\r" + line.ljust(last_log_line_width))
+                sys.stdout.flush()
+                last_carriage_line = line
+            else:
+                if last_carriage_line is not None and line == last_carriage_line:
+                    # Avoid printing the same progress line twice when a newline follows a carriage update.
+                    return
+                print(line, flush=True)
+                last_log_line_width = 0
+                last_carriage_line = None
+
+        def _drain_log(force_flush=False):
+            nonlocal log_offset, partial_log_line
+            if not log_path.exists():
+                return
+            try:
+                with open(log_path, "rb") as fh:
+                    fh.seek(log_offset)
+                    chunk = fh.read()
+                    log_offset = fh.tell()
+            except Exception as exc:
+                return
+            if not chunk and not force_flush and not partial_log_line:
+                return
+
+            text = partial_log_line + chunk.decode("utf-8", "replace")
+            idx = 0
+            new_partial = ""
+
+            while idx < len(text):
+                next_nl = text.find("\n", idx)
+                next_cr = text.find("\r", idx)
+                candidates = [p for p in (next_nl, next_cr) if p != -1]
+                if not candidates:
+                    new_partial = text[idx:]
+                    break
+                delim = min(candidates)
+                line = text[idx:delim]
+                carriage = (delim == next_cr)
+                _emit(line, carriage=carriage)
+                idx = delim + 1
+
+            if force_flush and new_partial:
+                _emit(new_partial, carriage=False)
+                partial_log_line = ""
+            else:
+                partial_log_line = new_partial
 
         curr_interval = poll_interval
         while True:
@@ -582,6 +642,7 @@ class IPySlurmExec(Magics):
                         result = json.load(handle)
                         if last_state is not None:
                             self._clear_status_line()
+                        _drain_log(force_flush=True)
                         return result
                     except json.JSONDecodeError:
                         pass
@@ -616,6 +677,9 @@ class IPySlurmExec(Magics):
                 )
                 self._write_status_line(message)
                 last_state = state
+                last_status_line = message
+
+            _drain_log()
             
             # Increase poll interval with time
             if secs_since_start > 60:

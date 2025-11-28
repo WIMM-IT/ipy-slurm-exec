@@ -1,3 +1,6 @@
+0.5
+Live-update cell with Slurm log output
+
 0.4
 Fallback for variables that don't like pickling: 
 use their save() load() functions.
