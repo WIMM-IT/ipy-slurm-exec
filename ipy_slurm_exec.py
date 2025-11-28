@@ -395,18 +395,21 @@ class IPySlurmExec(Magics):
                     sys.path = payload["sys_path"]
                     namespace = {}
                     namespace_errors = {}
+                    # for name, record in payload["variables"].items():
+                    #     try:
+                    #         namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
+                    #     except Exception as exc:
+                    #         mode = record.get("mode", "unknown")
+                    #         path = record.get("path")
+                    #         extra = f", path={path}" if path else ""
+                    #         trace_text = traceback.format_exc()
+                    #         namespace_errors[name] = f"{repr(exc)} [mode={mode}{extra}]\\n{trace_text}"
+                    # if namespace_errors:
+                    #     detail = "\\n".join(f"{var}: {err}" for var, err in sorted(namespace_errors.items()))
+                    #     raise RuntimeError(f"Failed to restore input variables:\\n{detail}")
+                    # Was the above engineering really necessary?
                     for name, record in payload["variables"].items():
-                        try:
-                            namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
-                        except Exception as exc:
-                            mode = record.get("mode", "unknown")
-                            path = record.get("path")
-                            extra = f", path={path}" if path else ""
-                            trace_text = traceback.format_exc()
-                            namespace_errors[name] = f"{repr(exc)} [mode={mode}{extra}]\\n{trace_text}"
-                    if namespace_errors:
-                        detail = "\\n".join(f"{var}: {err}" for var, err in sorted(namespace_errors.items()))
-                        raise RuntimeError(f"Failed to restore input variables:\\n{detail}")
+                        namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
                     for alias, module_name in payload["modules"].items():
                         try:
                             module = __import__(module_name)

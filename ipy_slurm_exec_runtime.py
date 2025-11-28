@@ -56,6 +56,23 @@ def is_pickle_safe(obj, protocol=pickle.HIGHEST_PROTOCOL):
         return False
     return True
 
+def pickle_safely(obj, protocol=pickle.HIGHEST_PROTOCOL):
+    """Only return pickled obj if obj did """
+    try:
+        probe = copy.copy(obj)
+    except Exception:
+        return None
+    sig_before = _deep_signature(probe)
+    pkl_obj = None
+    try:
+        pkl_obj = pickle.dumps(probe, protocol=protocol)
+    except Exception:
+        return None
+    sig_after = _deep_signature(probe)
+    if sig_before != sig_after:
+        return None
+    return pkl_obj
+
 
 def _has_single_path_param(fn, drop_first):
     try:
@@ -97,8 +114,13 @@ def _import_class(module_name, qualname):
 
 
 def serialize_variable(name, value, root_dir, rel_root, protocol=pickle.HIGHEST_PROTOCOL):
-    if is_pickle_safe(value, protocol=protocol):
-        return {"mode": "pickle", "data": pickle.dumps(value, protocol=protocol)}
+    pkl_obj = pickle_safely(value, protocol=protocol)
+    if pkl_obj is not None:
+        # Then was safe
+        #print(f"# DEBUG: '{name}': mode=pickle")
+        return {"mode": "pickle", "data": pkl_obj}
+
+    #print(f"# DEBUG: '{name}': mode=fallback save")
 
     handler = detect_save_load_pair(value)
     if handler is None:
@@ -132,8 +154,10 @@ def serialize_variable(name, value, root_dir, rel_root, protocol=pickle.HIGHEST_
 def restore_from_record(record, job_dir):
     mode = record.get("mode")
     if mode == "pickle":
+        #print(f"# DEBUG: loading with pickle")
         return pickle.loads(record["data"])
     if mode == "save_load":
+        #print(f"# DEBUG: loading with fallback load function")
         cls = _import_class(record["class_module"], record["class_qualname"])
         return cls.load(Path(job_dir) / record["path"])
     raise RuntimeError("Unknown record mode when restoring variable.")
