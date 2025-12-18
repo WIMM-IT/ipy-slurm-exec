@@ -1,5 +1,6 @@
 0.5
 Live-update cell with Slurm log output
+And other formatting improvements.
 
 0.4
 Fallback for variables that don't like pickling: 

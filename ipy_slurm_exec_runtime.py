@@ -4,6 +4,23 @@ import inspect
 import pickle
 from pathlib import Path
 
+class SerializeFailure(RuntimeError):
+    """Indicates an object cannot be serialized by :func:`serialize_variable`."""
+
+    def __init__(self, obj_type, name):
+        self.obj_type = obj_type
+        self.name = name
+        super().__init__(str(self))
+
+    def __str__(self):
+        module = (
+            ""
+            if self.obj_type.__module__ == "builtins"
+            else f"{self.obj_type.__module__}."
+        )
+        type_name = f"{module}{self.obj_type.__name__}"
+        return f"{self.name} <{type_name}>"
+
 
 def _deep_signature(obj, _seen=None):
     if _seen is None:
@@ -40,22 +57,6 @@ def _deep_signature(obj, _seen=None):
     return (type(obj).__name__, repr(obj))
 
 
-def is_pickle_safe(obj, protocol=pickle.HIGHEST_PROTOCOL):
-    """Return True if object survives pickle round-trip without mutating state."""
-    try:
-        probe = copy.copy(obj)
-    except Exception:
-        return False
-    sig_before = _deep_signature(probe)
-    try:
-        pickle.dumps(probe, protocol=protocol)
-    except Exception:
-        return False
-    sig_after = _deep_signature(probe)
-    if sig_before != sig_after:
-        return False
-    return True
-
 def pickle_safely(obj, protocol=pickle.HIGHEST_PROTOCOL):
     """Only return pickled obj if obj did """
     try:
@@ -63,7 +64,6 @@ def pickle_safely(obj, protocol=pickle.HIGHEST_PROTOCOL):
     except Exception:
         return None
     sig_before = _deep_signature(probe)
-    pkl_obj = None
     try:
         pkl_obj = pickle.dumps(probe, protocol=protocol)
     except Exception:
@@ -71,7 +71,7 @@ def pickle_safely(obj, protocol=pickle.HIGHEST_PROTOCOL):
     sig_after = _deep_signature(probe)
     if sig_before != sig_after:
         return None
-    return pkl_obj
+    return pickle.dumps(obj, protocol=protocol)
 
 
 def _has_single_path_param(fn, drop_first):
@@ -117,14 +117,11 @@ def serialize_variable(name, value, root_dir, rel_root, protocol=pickle.HIGHEST_
     pkl_obj = pickle_safely(value, protocol=protocol)
     if pkl_obj is not None:
         # Then was safe
-        #print(f"# DEBUG: '{name}': mode=pickle")
         return {"mode": "pickle", "data": pkl_obj}
-
-    #print(f"# DEBUG: '{name}': mode=fallback save")
 
     handler = detect_save_load_pair(value)
     if handler is None:
-        raise RuntimeError("Object is not pickle-safe and lacks a save/load pair.")
+        raise SerializeFailure(type(value), name)
 
     # Some save functions accept boolean knobs such as save_anndata; enable any that look like save flags.
     save_kwargs = {}
@@ -154,10 +151,8 @@ def serialize_variable(name, value, root_dir, rel_root, protocol=pickle.HIGHEST_
 def restore_from_record(record, job_dir):
     mode = record.get("mode")
     if mode == "pickle":
-        #print(f"# DEBUG: loading with pickle")
         return pickle.loads(record["data"])
     if mode == "save_load":
-        #print(f"# DEBUG: loading with fallback load function")
         cls = _import_class(record["class_module"], record["class_qualname"])
         return cls.load(Path(job_dir) / record["path"])
     raise RuntimeError("Unknown record mode when restoring variable.")

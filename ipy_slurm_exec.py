@@ -24,7 +24,7 @@ from typing import Optional, Required
 from IPython.core.error import UsageError
 from IPython.core.magic import Magics, line_cell_magic, line_magic, magics_class
 from IPython.display import HTML, display
-from ipy_slurm_exec_runtime import serialize_variable, restore_from_record
+from ipy_slurm_exec_runtime import SerializeFailure, serialize_variable, restore_from_record
 
 
 @dataclass
@@ -81,6 +81,7 @@ class IPySlurmExec(Magics):
             outputs = args.outputs,
             inputs = inputs,
             cell = cell,
+            capture_all_inputs = capture_all_inputs,
             capture_all_outputs = capture_all_outputs,
             job_dir = job_dir,
         )
@@ -110,6 +111,11 @@ class IPySlurmExec(Magics):
             poll_interval=args.poll_interval,
             max_wait=args.max_wait,
         )
+
+        if status.get("state") == "CANCELLED":
+            cancel_message = status.get("message", "Slurm job was cancelled.")
+            # UsageError to stop Notebook printing a traceback
+            raise UsageError(cancel_message)
 
         if status.get("state") != "COMPLETED":
             message = status.get("message", "Slurm job did not complete successfully.")
@@ -149,6 +155,9 @@ class IPySlurmExec(Magics):
         with open(output_path, "rb") as handle:
             result_payload = pickle.load(handle)
 
+        print("Job completed")
+
+        # Update Notebook namespace
         raw_namespace = result_payload.get("namespace", {})
         namespace_update = {}
         local_errors = {}
@@ -161,30 +170,96 @@ class IPySlurmExec(Magics):
                 else:
                     namespace_update[name] = value
             except Exception as exc:
-                local_errors[name] = str(exc)
+                if capture_all_outputs:
+                    # Treat as soft error because user didn't specify outputs
+                    local_errors[name] = str(exc)
+                else:
+                    raise
         remote_errors = result_payload.get("errors", {}) or {}
         if namespace_update:
             self.shell.push(namespace_update)
+
+        # Print nice summary of Notebook updates:
         updated_names = sorted(namespace_update.keys())
-        if len(updated_names) > 8:
-            display_names = ", ".join(updated_names[:8]) + ", …"
-        else:
-            display_names = ", ".join(updated_names) if updated_names else "<none>"
-        print("Job completed")
-        print(f"Imported variables: {display_names}")
         if remote_errors:
-            print("Skipped variables in Slurm job:")
+            serialize_fails = {}
+            other_fails = {}
             for name in sorted(remote_errors.keys()):
-                print("  {var}: '{err}'".format(var=name, err=remote_errors[name]))
+                err = remote_errors[name]
+                if err.startswith('SerializeFailure('):
+                    serialize_fails[name] = err
+                else:
+                    other_fails[name] = err
+            if len(serialize_fails) > 0:
+                msg = "Slurm job failed to export these variables:\n"
+                names = list(serialize_fails.keys())
+                for i in range(len(names)):
+                    name = names[i]
+                    err = serialize_fails[name]
+                    m = re.match(r'^SerializeFailure\((.*)\)$', err)
+                    if m:
+                        err_inner = m.group(1)
+                        err_inner = re.sub(r"^'|'$", '', err_inner)
+                    else:
+                        err_inner = err
+                    msg += f"- {err_inner}"
+                    if i < len(names)-1:
+                        msg += "\n"
+                print(msg)
+            if len(other_fails):
+                err_2_var = {}
+                for name, err in other_fails.items():
+                    if err not in err_2_var:
+                        err_2_var[err] = [name]
+                    else:
+                        err_2_var[err].append(name)
+            print("")
+
         if local_errors:
-            print("Skipped variables in Notebook:")
-            for name in sorted(local_errors.keys()):
-                print("  {var}: '{err}'".format(var=name, err=local_errors[name]))
-        if capture_all_outputs:
-            # avoid printing everything
-            namespace_update = None
-        
+            err_2_var = {}
+            for name, err in local_errors.items():
+                if err not in err_2_var:
+                    err_2_var[err] = [name]
+                else:
+                    err_2_var[err].append(name)
+            print("Failed importing these variables into Notebook:")
+            for err, names in err_2_var.items():
+                print(f"- {', '.join(names)}: '{err}'")
+            print("")
+
+        if updated_names is None or len(updated_names) == 0:
+            print("No variables imported")
+        else:
+            lines = []
+            line = ''
+            # line_width = 70
+            line_width = 80
+            for i in range(len(updated_names)):
+                n = updated_names[i]
+                if len(n) + len(line) + 2 > line_width:
+                    # overflow
+                    lines.append(line + ',')
+                    line = n
+                else:
+                    if i > 0:
+                        line += ", "
+                    line += f"{n}"
+            if line != "":
+                lines.append(line)
+            # msg = "Imported variables: " + lines[0]
+            msg = "Imported: " + lines[0]
+            for i in range(1, len(lines)):
+                # msg += "\n" + ' '*20 + lines[i]
+                msg += "\n" + ' '*10 + lines[i]
+            print(msg)
+
         self._report_job_efficiency(job_id, status.get("state"))
+
+        # if capture_all_outputs:
+        #     # avoid printing everything
+        #     namespace_update = None
+        # Don't print anyway
+        namespace_update = None
 
         return namespace_update
 
@@ -295,7 +370,7 @@ class IPySlurmExec(Magics):
             variables[name] = value
         return variables
 
-    def _build_slurm_exec_payload(self, outputs, inputs, cell, capture_all_outputs, job_dir):
+    def _build_slurm_exec_payload(self, outputs, inputs, cell, capture_all_inputs, capture_all_outputs, job_dir):
         module_aliases = {}
         for alias, value in self.shell.user_ns.items():
             if isinstance(value, types.ModuleType):
@@ -316,12 +391,35 @@ class IPySlurmExec(Magics):
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
             except Exception as exc:
-                errors[name] = str(exc)
+                errors[name] = exc
         if errors:
-            raise UsageError(
-                "Failed to serialize variables for %slurm_exec: "
-                + ", ".join(f"{k}: {v}" for k, v in errors.items())
-            )
+            serialize_fails = [ exc for exc in errors.values() if isinstance(exc, SerializeFailure) ]
+            if len(serialize_fails) > 0 and len(serialize_fails) == len(errors):
+                # This should be normal codepath
+                # reason = 'Not pickle-safe and lack pair of save/load functions'
+                if len(serialize_fails) == 1:
+                    msg = "%slurm_exec: Cannot export variable: "
+                    msg += f"{str(serialize_fails[0])}"
+                    # msg += f" (Inform developer: {reason})"
+                else:
+                    msg = "%slurm_exec: Cannot export these variables:\n"
+                    msg += "\n".join(f"- {str(exc)}" for exc in serialize_fails)
+                    # msg += f"\n(Inform developer: {reason})"
+
+                if capture_all_inputs:
+                    # treat as soft-error
+                    print(msg + "\n")
+                else:
+                    raise UsageError(msg)
+
+            else:
+                detail = ", ".join(f"{name}: {exc}" for name, exc in errors.items())
+                msg = "%slurm_exec: Failed to export variables. Reason: " + detail
+                if capture_all_inputs:
+                    # treat as soft-error
+                    print(msg)
+                else:
+                    raise UsageError(msg)
 
         return {
             "outputs": outputs,
@@ -330,6 +428,7 @@ class IPySlurmExec(Magics):
             "sys_path": list(sys.path),
             "cell": cell,
             "pickle_protocol": pickle.HIGHEST_PROTOCOL,
+            "capture_all_inputs": capture_all_inputs,
             "capture_all_outputs": capture_all_outputs,
         }
 
@@ -369,6 +468,7 @@ class IPySlurmExec(Magics):
             import sys
             import traceback
             import types
+            import importlib
             import importlib.util
             from pathlib import Path
 
@@ -393,6 +493,7 @@ class IPySlurmExec(Magics):
 
                     # Load imports and variables
                     sys.path = payload["sys_path"]
+                    capture_all_inputs = payload.get("capture_all_inputs", False)
                     namespace = {}
                     namespace_errors = {}
                     # for name, record in payload["variables"].items():
@@ -409,14 +510,29 @@ class IPySlurmExec(Magics):
                     #     raise RuntimeError(f"Failed to restore input variables:\\n{detail}")
                     # Was the above engineering really necessary?
                     for name, record in payload["variables"].items():
-                        namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
+                        try:
+                            namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
+                        except Exception as exc:
+                            if capture_all_inputs:
+                                # treat as soft error
+                                namespace_errors[name] = repr(exc)
+                            else:
+                                raise
                     for alias, module_name in payload["modules"].items():
                         try:
-                            module = __import__(module_name)
+                            module = importlib.import_module(module_name)
                         except Exception:
                             continue
                         namespace[alias] = module
 
+                    # Important to print import errors here, 
+                    # because they could be reason why cell execution fails next.
+                    if namespace_errors:
+                        print("Import errors in Slurm job:")
+                        for name in sorted(namespace_errors.keys()):
+                            print("  {var}: '{err}'".format(var=name, err=namespace_errors[name]))
+                    namespace_errors = {}
+                            
                     # Execute
                     cell_source = payload["cell"]
                     try:
@@ -440,6 +556,7 @@ class IPySlurmExec(Magics):
                         for name in vars_to_capture:
                             if name not in namespace:
                                 raise RuntimeError("Result variable '{var}' was not defined by the job.".format(var=name))
+                    capture_all_outputs = payload.get("capture_all_outputs", False)
                     namespace_payload = {}
                     namespace_errors = {}
                     for name in vars_to_capture:
@@ -453,7 +570,11 @@ class IPySlurmExec(Magics):
                                 protocol=payload["pickle_protocol"],
                             )
                         except Exception as exc:
-                            namespace_errors[name] = repr(exc)
+                            if capture_all_outputs:
+                                # treat as soft-error
+                                namespace_errors[name] = repr(exc)
+                            else:
+                                raise
 
                     # Write to pickle file
                     with open(OUTPUT_FILE, "wb") as handle:
@@ -507,7 +628,7 @@ class IPySlurmExec(Magics):
         modules_purge,
     ):
         submit_path = job_dir / "submit.sh"
-        lines = ["#!/bin/bash", "#SBATCH --export=ALL", "#SBATCH --chdir={}".format(job_dir)]
+        lines = ["#!/bin/bash", "#SBATCH --export=ALL"]
         lines.append("#SBATCH --job-name={}".format(job_label))
         lines.append("#SBATCH --output={}".format(job_dir / "slurm-%j.out"))
         lines.append("#SBATCH --error={}".format(job_dir / "slurm-%j.err"))
@@ -537,7 +658,10 @@ class IPySlurmExec(Magics):
             for module in modules:
                 lines.append("module load {}".format(module))
 
-        driver_path_relative = driver_path.relative_to(job_dir)
+        try:
+            driver_path_relative = driver_path.relative_to(Path.cwd())
+        except ValueError:
+            driver_path_relative = driver_path
         command = "exec {python} {driver}".format(
             python=shlex.quote(python_executable), driver=shlex.quote(str(driver_path_relative))
         )
@@ -661,6 +785,15 @@ class IPySlurmExec(Magics):
                         if last_state is not None:
                             self._clear_status_line()
                         return json.load(handle)
+                sacct_info = self._query_sacct_job_info(job_id)
+                final_state = sacct_info.get("state") if sacct_info else None
+                if final_state and final_state.upper().startswith("CANCEL"):
+                    cancel_message = "Job {job} has been cancelled (state: {state}).".format(
+                        job=job_id, state=final_state,
+                    )
+                    if last_state is not None:
+                        self._clear_status_line()
+                    return {"state": "CANCELLED", "message": cancel_message}
                 if last_state is not None:
                     self._clear_status_line()
                 raise RuntimeError(
@@ -670,11 +803,34 @@ class IPySlurmExec(Magics):
             state, checked = self._current_job_state(job_id)
             if state:
                 timestamp = checked or "--:--:--"
+                now = datetime.datetime.now()
+                base_state = state.split()[0]
                 message = "Job {job} status: {state} (checked {time})".format(
                     job=job_id,
                     state=state,
                     time=timestamp,
                 )
+
+                if base_state in {"PENDING", "RUNNING"}:
+                    sacct_info = self._query_sacct_job_info(job_id)
+                    if sacct_info:
+                        if base_state == "PENDING":
+                            submit_time = sacct_info.get("submit")
+                            if submit_time:
+                                duration = self._format_duration((now - submit_time).total_seconds())
+                                message = f"Job {job_id} status: {state} for {duration}"
+                        else:
+                            job_start_time = sacct_info.get("start")
+                            elapsed_secs = sacct_info.get("elapsed_secs")
+                            running_secs = None
+                            if job_start_time:
+                                running_secs = (now - job_start_time).total_seconds()
+                            elif elapsed_secs is not None:
+                                running_secs = elapsed_secs
+                            if running_secs is not None:
+                                duration = self._format_duration(running_secs)
+                                message = f"Job {job_id} status: {state} for {duration}"
+
                 self._write_status_line(message)
                 last_state = state
                 last_status_line = message
@@ -720,9 +876,87 @@ class IPySlurmExec(Magics):
         timestamp = time.strftime("%H:%M:%S", time.localtime())
         return state, timestamp
 
+    def _query_sacct_job_info(self, job_id):
+        if not self._command_available("sacct"):
+            return {}
+        process = Popen([ "sacct", "-j", job_id, "-o", "Submit,Start,Elapsed,State", "--noheader", "-p" ],
+            stdout=PIPE,
+            stderr=PIPE,
+        )
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            return {}
+        lines = stdout.decode("utf-8", "ignore").splitlines()
+        records = []
+        for line in lines:
+            if not line.strip():
+                continue
+            parts = line.split("|")
+            if len(parts) < 4:
+                continue
+            submit = self._parse_sacct_timestamp(parts[0])
+            start = self._parse_sacct_timestamp(parts[1])
+            elapsed = self._parse_sacct_elapsed(parts[2])
+            state = parts[3].strip()
+            records.append({"submit": submit, "start": start, "elapsed_secs": elapsed, "state": state})
+        if not records:
+            return {}
+        submits = [rec["submit"] for rec in records if rec["submit"]]
+        starts = [rec["start"] for rec in records if rec["start"]]
+        elapsed_values = [rec["elapsed_secs"] for rec in records if rec["elapsed_secs"] is not None]
+        states = [rec["state"] for rec in records if rec["state"]]
+        return {
+            "submit": min(submits) if submits else None,
+            "start": min(starts) if starts else None,
+            "elapsed_secs": max(elapsed_values) if elapsed_values else None,
+            "state": states[-1] if states else None,
+        }
+
+    def _parse_sacct_timestamp(self, value):
+        text = (value or "").strip()
+        if not text or text == "Unknown":
+            return None
+        text = text.split(".", 1)[0].rstrip("Z")
+        try:
+            return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+
+    def _parse_sacct_elapsed(self, value):
+        text = (value or "").strip()
+        if not text or text == "Unknown":
+            return None
+        days = 0
+        if "-" in text:
+            day_part, time_part = text.split("-", 1)
+            try:
+                days = int(day_part)
+            except ValueError:
+                days = 0
+        else:
+            time_part = text
+        parts = time_part.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            hours, minutes, seconds = (int(part) for part in parts)
+        except ValueError:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
     def _write_status_line(self, message):
         sys.stdout.write("\r{msg}".format(msg=message.ljust(80)))
         sys.stdout.flush()
+
+    def _format_duration(self, seconds):
+        secs = int(max(0, seconds))
+        hours, remainder = divmod(secs, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return "{hours:02}:{minutes:02}:{seconds:02}".format(
+            hours=hours,
+            minutes=minutes,
+            seconds=secs,
+        )
 
     def _clear_status_line(self):
         sys.stdout.write("\r" + " " * 80 + "\r")
@@ -731,13 +965,14 @@ class IPySlurmExec(Magics):
     def _report_job_efficiency(self, job_id, final_state):
         if not self._command_available("reportseff"):
             if not self._warned_reportseff_missing:
-                print("Skipping resource efficiency report: 'reportseff' command not found.")
+                # print("Skipping resource efficiency report: 'reportseff' command not found.")
                 self._warned_reportseff_missing = True
             return
         
         time.sleep(1)  # Give Slurm a moment to update
         nrepeats = 3
-        while nrepeats > 0:
+        n = 0
+        while n < nrepeats:
             # Can take a few seconds for Slurm accounting to update.
             # For very-short jobs, don't ever expect a value for CPU use.
             process = Popen(["reportseff", str(job_id)], stdout=PIPE, stderr=PIPE)
@@ -745,7 +980,11 @@ class IPySlurmExec(Magics):
             cmd = ' '.join(["reportseff", str(job_id)])
             # print(f"# cmd = {cmd}")
             # print("# reportseff raw output:") ; print(stdout)
+            n += 1
             if process.returncode != 0:
+                if n < nrepeats:
+                    time.sleep(1 + n)
+                    continue
                 error_message = stderr.decode("utf-8", "ignore").strip()
                 if error_message:
                     print("Failed to collect resource efficiency (reportseff): {err}".format(err=error_message))
@@ -758,8 +997,8 @@ class IPySlurmExec(Magics):
             # print("# parsed:") ; print(parsed)
             if parsed['Elapsed'] != '---' and parsed['MemEff'] != '---':
                 break
-                nrepeats -= 1
-            time.sleep(1)
+            n += 1
+            time.sleep(n+1)
 
         # state_note = " ({})".format(final_state) if final_state else ""
         # print("Resource efficiency (reportseff{note}):".format(note=state_note))
