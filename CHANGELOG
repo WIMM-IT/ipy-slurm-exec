@@ -1,3 +1,7 @@
+0.6
+Improve UX
+Fixes for import/export
+
 0.5
 Live-update cell with Slurm log output
 And other formatting improvements.
@@ -13,4 +17,3 @@ Improve job error reporting.
 
 0.2
 Add Slurm job efficiency reporting.
-
