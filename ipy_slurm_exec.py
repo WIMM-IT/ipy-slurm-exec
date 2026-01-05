@@ -629,9 +629,9 @@ class IPySlurmExec(Magics):
     ):
         submit_path = job_dir / "submit.sh"
         lines = ["#!/bin/bash", "#SBATCH --export=ALL"]
-        lines.append("#SBATCH --job-name={}".format(job_label))
-        lines.append("#SBATCH --output={}".format(job_dir / "slurm-%j.out"))
-        lines.append("#SBATCH --error={}".format(job_dir / "slurm-%j.err"))
+        lines.append("#SBATCH --job-name='{}'".format(job_label))
+        lines.append("#SBATCH --output='{}'".format(job_dir / "slurm-%j.out"))
+        lines.append("#SBATCH --error='{}'".format(job_dir / "slurm-%j.err"))
         if sbatch_params.account:
             lines.append("#SBATCH --account={}".format(sbatch_params.account))
         if sbatch_params.qos:

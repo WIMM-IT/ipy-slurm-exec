@@ -1,0 +1,25 @@
+[metadata]
+name = ipy-slurm-exec
+version = <VERSION>
+author = Andrew Owenson
+author_email = andrew.owenson@imm.ox.ac.uk
+description = Jupyter Notebook + Slurm integration.
+long_description = file: README.md
+long_description_content_type = text/markdown
+url = https://github.com/WIMM-IT/ipy-slurm-exec
+project_urls =
+    Bug Tracker = https://github.com/WIMM-IT/ipy-slurm-exec/issues
+license = BSD-3-Clause
+license_files = LICENSE.txt
+classifiers =
+    Programming Language :: Python :: 3
+    License :: OSI Approved :: BSD License
+    Operating System :: OS Independent
+
+[options]
+py_modules =
+    ipy_slurm_exec
+    ipy_slurm_exec_runtime
+python_requires = >=3.9
+install_requires =
+    ipython

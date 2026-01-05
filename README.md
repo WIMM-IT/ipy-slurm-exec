@@ -2,34 +2,7 @@
 
 Jupyter Notebook + Slurm integration.
 
-## Quick start
-
-Setup data in Notebook:
-```
-import numpy as np
-data = np.arange(12).reshape(3, 4)
-scale = 2.5
-```
-
-Use `%%slurm_exec` cell magic to specify code to run in a Slurm cluster job:
-```
-%%slurm_exec
-scaled = np.asarray(data) * scale
-reduced = scaled.sum(axis=0)
-```
-
-Execution report:
-```
-Submitted Slurm job ...
-Job completed                                                                   
-Updated variables: data, reduced, scale, scaled
-```
-
-Print result in Notebook:
-```
-print(reduced)
-[30.  37.5 45.  52.5]
-```
+![Simple example](https://github.com/WIMM-IT/ipy-slurm-exec/raw/main/docs/demo.gif)
 
 ## `slurm_exec` arguments:
 
@@ -94,24 +67,34 @@ e.g. %%slurm_exec ... --modules=+cuda
 
 Bringing everything together, here is a more realistic example - running a Notebook cell on a GPU.
 
+Import `ipy_slurm_exec`
+```
+import ipy_slurm_exec
+%load_ext ipy_slurm_exec
+```
+
 Setup data in Notebook:
 ```
+import torch
 import numpy as np
-vector = np.linspace(0, 9, 10)
+seed = 123
+vector = np.linspace(-2, 2, 256, dtype=np.float32)
+torch.manual_seed(seed)
 ```
 
 Code to run on a GPU:
 ```
-%%slurm_exec -i vector -o gpu_result --partition=gpu --gpus=1 --time=00:10:00 --modules=+cuda
-import cupy as cp
-device_vec = cp.asarray(vector)
-gpu_result = cp.asnumpy(device_vec ** 2)
+%%slurm_exec -i seed,vector -o torch_result --partition=gpu --gpus=1 --mem=1G
+torch.manual_seed(seed)
+device = torch.device("cuda")
+x = torch.from_numpy(vector).to(device)
+y = torch.tanh(x @ x.T)
+torch_result = y.sum().item()
 ```
 
 Execution report:
 ```
-Submitted Slurm job ...
+Submitted Slurm job 1326 (folder: slurm_exec/20251223T1152-dc0f96dc)
 Job completed                                                                   
-Updated variables: gpu_result
-{'gpu_result': array([ 0.,  1.,  4.,  9., 16., 25., 36., 49., 64., 81.])}
+Imported: torch_result
 ```
