@@ -2,6 +2,10 @@
 
 Jupyter Notebook + Slurm integration.
 
+```
+pip install ipy-slurm-exec
+```
+
 ![Simple example](https://github.com/WIMM-IT/ipy-slurm-exec/raw/main/docs/demo.gif)
 
 ## `slurm_exec` arguments:
