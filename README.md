@@ -1,12 +1,14 @@
 # ipy-slurm-exec
 
-Jupyter Notebook + Slurm integration.
+Real Slurm magic - execute individual Jupyter Notebook cells on your Slurm cluster e.g. GPU offload.
+
+![Simple example](https://github.com/WIMM-IT/ipy-slurm-exec/raw/main/docs/demo.gif)
+
+## Install
 
 ```
 pip install ipy-slurm-exec
 ```
-
-![Simple example](https://github.com/WIMM-IT/ipy-slurm-exec/raw/main/docs/demo.gif)
 
 ## `slurm_exec` arguments:
 
