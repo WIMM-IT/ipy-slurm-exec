@@ -2,6 +2,8 @@ import copy
 import importlib
 import inspect
 import pickle
+import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 
 class SerializeFailure(RuntimeError):
@@ -20,6 +22,36 @@ class SerializeFailure(RuntimeError):
         )
         type_name = f"{module}{self.obj_type.__name__}"
         return f"{self.name} <{type_name}>"
+
+
+@dataclass(frozen=True)
+class FunctionRef:
+    name: str
+    format: str
+    payload: object
+
+    def to_record(self):
+        return {
+            "mode": "function_ref",
+            "name": self.name,
+            "format": self.format,
+            "payload": self.payload,
+        }
+
+
+def _is_defined_function(obj):
+    return inspect.isfunction(obj) and getattr(obj, "__qualname__", "") == getattr(obj, "__name__", "")
+
+
+def serialize_function(name, func):
+    if not _is_defined_function(func):
+        raise SerializeFailure(type(func), name)
+    try:
+        source = inspect.getsource(func)
+    except Exception as exc:
+        raise SerializeFailure(type(func), name) from exc
+    print(f"%slurm_exec debug: function '{name}' serialized as source", flush=True)
+    return FunctionRef(name=func.__name__, format="source", payload=textwrap.dedent(source)).to_record()
 
 
 def _deep_signature(obj, _seen=None):
@@ -156,3 +188,18 @@ def restore_from_record(record, job_dir):
         cls = _import_class(record["class_module"], record["class_qualname"])
         return cls.load(Path(job_dir) / record["path"])
     raise RuntimeError("Unknown record mode when restoring variable.")
+
+
+def restore_function_from_record(record, job_dir, globals_ns=None):
+    if globals_ns is None:
+        globals_ns = {"__builtins__": __builtins__}
+    mode = record.get("mode")
+    if mode != "function_ref":
+        raise RuntimeError("Unknown record mode when restoring function.")
+    fmt = record.get("format")
+    payload = record.get("payload")
+    if fmt == "source":
+        print(f"%slurm_exec debug: restoring function from source payload", flush=True)
+        exec(payload, globals_ns)
+        return globals_ns[record["name"]]
+    raise RuntimeError("Unknown function payload format.")

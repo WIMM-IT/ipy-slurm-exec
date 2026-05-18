@@ -16,6 +16,7 @@ import textwrap
 import time
 import types
 import uuid
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import PIPE, Popen
@@ -24,7 +25,7 @@ from typing import Optional, Required
 from IPython.core.error import UsageError
 from IPython.core.magic import Magics, line_cell_magic, line_magic, magics_class
 from IPython.display import HTML, display
-from ipy_slurm_exec_runtime import SerializeFailure, serialize_variable, restore_from_record
+from ipy_slurm_exec_runtime import SerializeFailure, serialize_variable, serialize_function, restore_from_record
 
 
 @dataclass
@@ -71,15 +72,16 @@ class IPySlurmExec(Magics):
         capture_all_outputs = args.outputs is None or len(args.outputs) == 0 or (args.outputs[0] == '*')
 
         if capture_all_inputs:
-            inputs = self._collect_all_user_variables()
+            inputs, functions = self._collect_all_user_variables()
         else:
-            inputs = self._collect_input_variables(args.inputs)
+            inputs, functions = self._collect_input_bindings(args.inputs)
 
         job_dir, job_label = self._create_job_directory(args.sbatch_params.job_name)
 
         payload = self._build_slurm_exec_payload(
             outputs = args.outputs,
             inputs = inputs,
+            functions = functions,
             cell = cell,
             capture_all_inputs = capture_all_inputs,
             capture_all_outputs = capture_all_outputs,
@@ -344,20 +346,41 @@ class IPySlurmExec(Magics):
             max_wait = args.max_wait
         )
 
-    def _collect_input_variables(self, input_names):
+    def _collect_input_bindings(self, input_names):
         variables = {}
+        functions = {}
         for name in input_names:
+            print(f"%slurm_exec debug: resolving input '{name}'", flush=True)
             if name not in self.shell.user_ns:
                 raise UsageError(
                     "Variable '{name}' not found in the notebook namespace.".format(
                         name=name
                     )
                 )
-            variables[name] = self.shell.user_ns[name]
-        return variables
+            value = self.shell.user_ns[name]
+            if inspect.isfunction(value):
+                if getattr(value, "__qualname__", "") != getattr(value, "__name__", ""):
+                    raise UsageError(
+                        "Input '{name}' is a nested or local function. Only top-level functions are supported.".format(
+                            name=name
+                        )
+                    )
+                print(
+                    f"%slurm_exec debug: input '{name}' classified as function {value.__module__}.{value.__name__}",
+                    flush=True,
+                )
+                functions[name] = value
+            else:
+                print(
+                    f"%slurm_exec debug: input '{name}' classified as variable type {type(value).__module__}.{type(value).__name__}",
+                    flush=True,
+                )
+                variables[name] = value
+        return variables, functions
 
     def _collect_all_user_variables(self):
         variables = {}
+        functions = {}
         hidden = set(getattr(self.shell, "user_ns_hidden", []))
         reserved = {"In", "Out", "get_ipython", "exit", "quit"}
         for name, value in self.shell.user_ns.items():
@@ -367,10 +390,16 @@ class IPySlurmExec(Magics):
                 continue
             if isinstance(value, types.ModuleType):
                 continue
-            variables[name] = value
-        return variables
+            if inspect.isfunction(value):
+                # if getattr(value, "__qualname__", "") != getattr(value, "__name__", ""):
+                #     continue
+                # functions[name] = value
+                pass
+            else:
+                variables[name] = value
+        return variables, functions
 
-    def _build_slurm_exec_payload(self, outputs, inputs, cell, capture_all_inputs, capture_all_outputs, job_dir):
+    def _build_slurm_exec_payload(self, outputs, inputs, functions, cell, capture_all_inputs, capture_all_outputs, job_dir):
         module_aliases = {}
         for alias, value in self.shell.user_ns.items():
             if isinstance(value, types.ModuleType):
@@ -383,6 +412,10 @@ class IPySlurmExec(Magics):
         errors = {}
         for name, value in inputs.items():
             try:
+                print(
+                    f"%slurm_exec debug: serializing variable input '{name}' as payload record",
+                    flush=True,
+                )
                 serialized_vars[name] = serialize_variable(
                     name=name,
                     value=value,
@@ -392,17 +425,27 @@ class IPySlurmExec(Magics):
                 )
             except Exception as exc:
                 errors[name] = exc
+        serialized_functions = {}
+        for name, func in functions.items():
+            try:
+                print(
+                    f"%slurm_exec debug: serializing function input '{name}' from {func.__module__}.{func.__name__}",
+                    flush=True,
+                )
+                serialized_functions[name] = serialize_function(name=name, func=func)
+            except Exception as exc:
+                errors[name] = exc
         if errors:
             serialize_fails = [ exc for exc in errors.values() if isinstance(exc, SerializeFailure) ]
             if len(serialize_fails) > 0 and len(serialize_fails) == len(errors):
                 # This should be normal codepath
                 # reason = 'Not pickle-safe and lack pair of save/load functions'
                 if len(serialize_fails) == 1:
-                    msg = "%slurm_exec: Cannot export variable: "
+                    msg = "%slurm_exec: Cannot export input: "
                     msg += f"{str(serialize_fails[0])}"
                     # msg += f" (Inform developer: {reason})"
                 else:
-                    msg = "%slurm_exec: Cannot export these variables:\n"
+                    msg = "%slurm_exec: Cannot export these inputs:\n"
                     msg += "\n".join(f"- {str(exc)}" for exc in serialize_fails)
                     # msg += f"\n(Inform developer: {reason})"
 
@@ -414,7 +457,7 @@ class IPySlurmExec(Magics):
 
             else:
                 detail = ", ".join(f"{name}: {exc}" for name, exc in errors.items())
-                msg = "%slurm_exec: Failed to export variables. Reason: " + detail
+                msg = "%slurm_exec: Failed to export inputs. Reason: " + detail
                 if capture_all_inputs:
                     # treat as soft-error
                     print(msg)
@@ -424,6 +467,7 @@ class IPySlurmExec(Magics):
         return {
             "outputs": outputs,
             "variables": serialized_vars,
+            "functions": serialized_functions,
             "modules": module_aliases,
             "sys_path": list(sys.path),
             "cell": cell,
@@ -467,6 +511,7 @@ class IPySlurmExec(Magics):
             import pickle
             import sys
             import traceback
+            import inspect
             import types
             import importlib
             import importlib.util
@@ -496,6 +541,13 @@ class IPySlurmExec(Magics):
                     capture_all_inputs = payload.get("capture_all_inputs", False)
                     namespace = {}
                     namespace_errors = {}
+                    functions = payload.get("functions", {})
+                    print(
+                        "%slurm_exec debug: loaded {n} function input record(s) from payload".format(
+                            n=len(functions)
+                        ),
+                        flush=True,
+                    )
                     # for name, record in payload["variables"].items():
                     #     try:
                     #         namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
@@ -511,6 +563,10 @@ class IPySlurmExec(Magics):
                     # Was the above engineering really necessary?
                     for name, record in payload["variables"].items():
                         try:
+                            print(
+                                f"%slurm_exec debug: restoring variable input '{name}' from payload record",
+                                flush=True,
+                            )
                             namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
                         except Exception as exc:
                             if capture_all_inputs:
@@ -524,6 +580,18 @@ class IPySlurmExec(Magics):
                         except Exception:
                             continue
                         namespace[alias] = module
+                    for name, record in functions.items():
+                        try:
+                            print(
+                                f"%slurm_exec debug: restoring function input '{name}' from function record",
+                                flush=True,
+                            )
+                            namespace[name] = _runtime.restore_function_from_record(record, JOB_DIR, namespace)
+                        except Exception as exc:
+                            if capture_all_inputs:
+                                namespace_errors[name] = repr(exc)
+                            else:
+                                raise
 
                     # Important to print import errors here, 
                     # because they could be reason why cell execution fails next.
@@ -549,6 +617,8 @@ class IPySlurmExec(Magics):
                             if name == "__builtins__":
                                 continue
                             if isinstance(value, types.ModuleType):
+                                continue
+                            if inspect.isfunction(value):
                                 continue
                             vars_to_capture.append(name)
                     else:
