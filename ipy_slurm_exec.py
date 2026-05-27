@@ -25,7 +25,13 @@ from typing import Optional, Required
 from IPython.core.error import UsageError
 from IPython.core.magic import Magics, line_cell_magic, line_magic, magics_class
 from IPython.display import HTML, display
-from ipy_slurm_exec_runtime import SerializeFailure, serialize_variable, serialize_function, restore_from_record
+from ipy_slurm_exec_runtime import (
+    SerializeFailure,
+    restore_from_record,
+    serialize_class,
+    serialize_function,
+    serialize_variable,
+)
 
 
 @dataclass
@@ -56,6 +62,7 @@ class NotebookJob:
 @magics_class
 class IPySlurmExec(Magics):
     def __init__(self, shell=None, **kwargs):
+        """Initialize the magic and ensure the local Slurm job directory exists."""
         super(IPySlurmExec, self).__init__(shell, **kwargs)
         self._jobs_root = Path.cwd() / "slurm_exec"
         self._jobs_root.mkdir(parents=True, exist_ok=True)
@@ -68,23 +75,28 @@ class IPySlurmExec(Magics):
             raise UsageError("%%slurm_exec must be used as a cell magic.")
 
         args = self._parse_slurm_exec_args(line)
-        capture_all_inputs = args.inputs is None or len(args.inputs) == 0 or (args.inputs[0] == '*')
+        capture_all_input_vars = args.inputs is None or len(args.inputs) == 0 or ('*' in args.inputs)
         capture_all_outputs = args.outputs is None or len(args.outputs) == 0 or (args.outputs[0] == '*')
 
-        if capture_all_inputs:
-            inputs, functions = self._collect_all_user_variables()
-        else:
-            inputs, functions = self._collect_input_bindings(args.inputs)
+        named_inputs = set(self._named_inputs(args.inputs))
+        input_vars = self._collect_all_user_variables() if capture_all_input_vars else {}
+        functions, classes = {}, {}
+        named_vars, named_funcs, named_classes = self._collect_inputs(named_inputs)
+        input_vars.update(named_vars)
+        functions.update(named_funcs)
+        classes.update(named_classes)
 
         job_dir, job_label = self._create_job_directory(args.sbatch_params.job_name)
 
         payload = self._build_slurm_exec_payload(
             outputs = args.outputs,
-            inputs = inputs,
+            input_vars = input_vars,
             functions = functions,
+            classes = classes,
             cell = cell,
-            capture_all_inputs = capture_all_inputs,
+            capture_all_input_vars = capture_all_input_vars,
             capture_all_outputs = capture_all_outputs,
+            named_inputs = named_inputs,
             job_dir = job_dir,
         )
         payload_path = job_dir / "payload.pkl"
@@ -166,7 +178,7 @@ class IPySlurmExec(Magics):
         for name, value in raw_namespace.items():
             try:
                 if isinstance(value, dict) and "mode" in value:
-                    namespace_update[name] = restore_from_record(value, job_dir)
+                    namespace_update[name] = restore_from_record(value, job_dir, self.shell.user_ns)
                 elif isinstance(value, bytes):
                     namespace_update[name] = pickle.loads(value)
                 else:
@@ -266,6 +278,7 @@ class IPySlurmExec(Magics):
         return namespace_update
 
     def _parse_slurm_exec_args(self, line):
+        """Parse a %slurm_exec command line into notebook and Slurm job options."""
         parser = argparse.ArgumentParser(
             prog="%slurm_exec",
             description="Execute Python code on a Slurm allocation and return the result.",
@@ -309,6 +322,7 @@ class IPySlurmExec(Magics):
             purge = True
         
         def _norm_csv_list(x):
+            """Flatten repeated comma-separated option values into a clean list."""
             y = []
             for entry in x:
                 for raw in entry.split(","):
@@ -346,41 +360,34 @@ class IPySlurmExec(Magics):
             max_wait = args.max_wait
         )
 
-    def _collect_input_bindings(self, input_names):
+    def _named_inputs(self, input_names):
+        """Return explicitly named input variables, excluding the wildcard marker."""
+        return [ name for name in input_names if name != "*" ]
+
+    def _collect_inputs(self, input_names):
+        """Collect requested notebook names and separate variables, functions, and classes."""
         variables = {}
         functions = {}
+        classes = {}
         for name in input_names:
-            print(f"%slurm_exec debug: resolving input '{name}'", flush=True)
             if name not in self.shell.user_ns:
-                raise UsageError(
-                    "Variable '{name}' not found in the notebook namespace.".format(
-                        name=name
-                    )
-                )
+                raise UsageError(f"Variable '{name}' not found in the Notebook namespace.")
             value = self.shell.user_ns[name]
             if inspect.isfunction(value):
                 if getattr(value, "__qualname__", "") != getattr(value, "__name__", ""):
-                    raise UsageError(
-                        "Input '{name}' is a nested or local function. Only top-level functions are supported.".format(
-                            name=name
-                        )
-                    )
-                print(
-                    f"%slurm_exec debug: input '{name}' classified as function {value.__module__}.{value.__name__}",
-                    flush=True,
-                )
+                    raise UsageError(f"Input '{name}' is a nested or local function. Only top-level functions are supported.")
                 functions[name] = value
+            elif inspect.isclass(value):
+                if getattr(value, "__qualname__", "") != getattr(value, "__name__", ""):
+                    raise UsageError(f"Input '{name}' is a nested or local class. Only top-level classes are supported.")
+                classes[name] = value
             else:
-                print(
-                    f"%slurm_exec debug: input '{name}' classified as variable type {type(value).__module__}.{type(value).__name__}",
-                    flush=True,
-                )
                 variables[name] = value
-        return variables, functions
+        return variables, functions, classes
 
     def _collect_all_user_variables(self):
+        """Collect non-hidden user variables from the notebook namespace."""
         variables = {}
-        functions = {}
         hidden = set(getattr(self.shell, "user_ns_hidden", []))
         reserved = {"In", "Out", "get_ipython", "exit", "quit"}
         for name, value in self.shell.user_ns.items():
@@ -390,16 +397,14 @@ class IPySlurmExec(Magics):
                 continue
             if isinstance(value, types.ModuleType):
                 continue
-            if inspect.isfunction(value):
-                # if getattr(value, "__qualname__", "") != getattr(value, "__name__", ""):
-                #     continue
-                # functions[name] = value
+            if inspect.isfunction(value) or inspect.isclass(value):
                 pass
             else:
                 variables[name] = value
-        return variables, functions
+        return variables
 
-    def _build_slurm_exec_payload(self, outputs, inputs, functions, cell, capture_all_inputs, capture_all_outputs, job_dir):
+    def _build_slurm_exec_payload(self, outputs, input_vars, functions, classes, cell, capture_all_input_vars, capture_all_outputs, named_inputs, job_dir):
+        """Serialize inputs and assemble the payload consumed by the remote driver."""
         module_aliases = {}
         for alias, value in self.shell.user_ns.items():
             if isinstance(value, types.ModuleType):
@@ -410,17 +415,13 @@ class IPySlurmExec(Magics):
 
         serialized_vars = {}
         errors = {}
-        for name, value in inputs.items():
+        for name, value in input_vars.items():
             try:
-                print(
-                    f"%slurm_exec debug: serializing variable input '{name}' as payload record",
-                    flush=True,
-                )
                 serialized_vars[name] = serialize_variable(
                     name=name,
                     value=value,
                     root_dir=job_dir,
-                    rel_root="inputs",
+                    rel_root="input_vars",
                     protocol=pickle.HIGHEST_PROTOCOL,
                 )
             except Exception as exc:
@@ -428,14 +429,17 @@ class IPySlurmExec(Magics):
         serialized_functions = {}
         for name, func in functions.items():
             try:
-                print(
-                    f"%slurm_exec debug: serializing function input '{name}' from {func.__module__}.{func.__name__}",
-                    flush=True,
-                )
                 serialized_functions[name] = serialize_function(name=name, func=func)
             except Exception as exc:
                 errors[name] = exc
+        serialized_classes = {}
+        for name, cls in classes.items():
+            try:
+                serialized_classes[name] = serialize_class(name=name, cls=cls)
+            except Exception as exc:
+                errors[name] = exc
         if errors:
+            has_strict_error = any(name in named_inputs for name in errors)
             serialize_fails = [ exc for exc in errors.values() if isinstance(exc, SerializeFailure) ]
             if len(serialize_fails) > 0 and len(serialize_fails) == len(errors):
                 # This should be normal codepath
@@ -449,7 +453,7 @@ class IPySlurmExec(Magics):
                     msg += "\n".join(f"- {str(exc)}" for exc in serialize_fails)
                     # msg += f"\n(Inform developer: {reason})"
 
-                if capture_all_inputs:
+                if capture_all_input_vars and not has_strict_error:
                     # treat as soft-error
                     print(msg + "\n")
                 else:
@@ -458,7 +462,7 @@ class IPySlurmExec(Magics):
             else:
                 detail = ", ".join(f"{name}: {exc}" for name, exc in errors.items())
                 msg = "%slurm_exec: Failed to export inputs. Reason: " + detail
-                if capture_all_inputs:
+                if capture_all_input_vars and not has_strict_error:
                     # treat as soft-error
                     print(msg)
                 else:
@@ -468,15 +472,17 @@ class IPySlurmExec(Magics):
             "outputs": outputs,
             "variables": serialized_vars,
             "functions": serialized_functions,
+            "classes": serialized_classes,
             "modules": module_aliases,
             "sys_path": list(sys.path),
             "cell": cell,
             "pickle_protocol": pickle.HIGHEST_PROTOCOL,
-            "capture_all_inputs": capture_all_inputs,
+            "capture_all_input_vars": capture_all_input_vars,
             "capture_all_outputs": capture_all_outputs,
         }
 
     def _create_job_directory(self, requested_name=''):
+        """Create a unique directory and Slurm-safe label for one submitted job."""
         base = requested_name or ''
         base = re.sub(r"[^A-Za-z0-9._-]", "-", base).strip("-")
         base64 = base[:64]
@@ -490,6 +496,7 @@ class IPySlurmExec(Magics):
         return job_dir, job_label[:100]
 
     def _write_payload(self, path, payload):
+        """Write the serialized job payload to disk for the driver script."""
         try:
             with open(path, "wb") as handle:
                 pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -501,6 +508,7 @@ class IPySlurmExec(Magics):
             )
 
     def _write_driver_script(self, job_dir):
+        """Write the Python driver that restores inputs, executes the cell, and saves outputs."""
         helper_src = Path(__file__).with_name("ipy_slurm_exec_runtime.py")
         helper_dest = job_dir / "ipy_slurm_exec_runtime.py"
         shutil.copyfile(helper_src, helper_dest)
@@ -523,6 +531,7 @@ class IPySlurmExec(Magics):
             OUTPUT_FILE = JOB_DIR / "output.pkl"
             TRACEBACK_FILE = JOB_DIR / "traceback.log"
             CELL_FILE = JOB_DIR / "cell.py"
+            INPUT_SOURCE_DIR = JOB_DIR / "input_sources"
 
             HELPER_FILE = JOB_DIR / "ipy_slurm_exec_runtime.py"
             _spec = importlib.util.spec_from_file_location("ipy_slurm_exec_runtime", HELPER_FILE)
@@ -538,42 +547,15 @@ class IPySlurmExec(Magics):
 
                     # Load imports and variables
                     sys.path = payload["sys_path"]
-                    capture_all_inputs = payload.get("capture_all_inputs", False)
+                    capture_all_input_vars = payload.get(
+                        "capture_all_input_vars",
+                        payload.get("capture_all_input_vars", False),
+                    )
                     namespace = {}
                     namespace_errors = {}
                     functions = payload.get("functions", {})
-                    print(
-                        "%slurm_exec debug: loaded {n} function input record(s) from payload".format(
-                            n=len(functions)
-                        ),
-                        flush=True,
-                    )
-                    # for name, record in payload["variables"].items():
-                    #     try:
-                    #         namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
-                    #     except Exception as exc:
-                    #         mode = record.get("mode", "unknown")
-                    #         path = record.get("path")
-                    #         extra = f", path={path}" if path else ""
-                    #         trace_text = traceback.format_exc()
-                    #         namespace_errors[name] = f"{repr(exc)} [mode={mode}{extra}]\\n{trace_text}"
-                    # if namespace_errors:
-                    #     detail = "\\n".join(f"{var}: {err}" for var, err in sorted(namespace_errors.items()))
-                    #     raise RuntimeError(f"Failed to restore input variables:\\n{detail}")
-                    # Was the above engineering really necessary?
-                    for name, record in payload["variables"].items():
-                        try:
-                            print(
-                                f"%slurm_exec debug: restoring variable input '{name}' from payload record",
-                                flush=True,
-                            )
-                            namespace[name] = _runtime.restore_from_record(record, JOB_DIR)
-                        except Exception as exc:
-                            if capture_all_inputs:
-                                # treat as soft error
-                                namespace_errors[name] = repr(exc)
-                            else:
-                                raise
+                    classes = payload.get("classes", {})
+                    INPUT_SOURCE_DIR.mkdir(exist_ok=True)
                     for alias, module_name in payload["modules"].items():
                         try:
                             module = importlib.import_module(module_name)
@@ -582,13 +564,34 @@ class IPySlurmExec(Magics):
                         namespace[alias] = module
                     for name, record in functions.items():
                         try:
-                            print(
-                                f"%slurm_exec debug: restoring function input '{name}' from function record",
-                                flush=True,
-                            )
+                            source_path = INPUT_SOURCE_DIR / f"function_{name}.py"
+                            if record.get("format") == "source":
+                                source_path.write_text(record["payload"])
+                                record["filename"] = str(source_path)
                             namespace[name] = _runtime.restore_function_from_record(record, JOB_DIR, namespace)
                         except Exception as exc:
-                            if capture_all_inputs:
+                            if capture_all_input_vars:
+                                namespace_errors[name] = repr(exc)
+                            else:
+                                raise
+                    for name, record in classes.items():
+                        try:
+                            source_path = INPUT_SOURCE_DIR / f"class_{name}.py"
+                            if record.get("format") == "source":
+                                source_path.write_text(record["payload"])
+                                record["filename"] = str(source_path)
+                            namespace[name] = _runtime.restore_class_from_record(record, JOB_DIR, namespace)
+                        except Exception as exc:
+                            if capture_all_input_vars:
+                                namespace_errors[name] = repr(exc)
+                            else:
+                                raise
+                    for name, record in payload["variables"].items():
+                        try:
+                            namespace[name] = _runtime.restore_from_record(record, JOB_DIR, namespace)
+                        except Exception as exc:
+                            if capture_all_input_vars:
+                                # treat as soft error
                                 namespace_errors[name] = repr(exc)
                             else:
                                 raise
@@ -618,7 +621,7 @@ class IPySlurmExec(Magics):
                                 continue
                             if isinstance(value, types.ModuleType):
                                 continue
-                            if inspect.isfunction(value):
+                            if inspect.isfunction(value) or inspect.isclass(value):
                                 continue
                             vars_to_capture.append(name)
                     else:
@@ -642,6 +645,8 @@ class IPySlurmExec(Magics):
                         except Exception as exc:
                             if capture_all_outputs:
                                 # treat as soft-error
+                                namespace_errors[name] = repr(exc)
+                            elif isinstance(exc, _runtime.SerializeFailure) and _runtime.is_source_restored_class_instance(value):
                                 namespace_errors[name] = repr(exc)
                             else:
                                 raise
@@ -697,6 +702,7 @@ class IPySlurmExec(Magics):
         modules,
         modules_purge,
     ):
+        """Write the sbatch shell script used to launch the remote driver."""
         submit_path = job_dir / "submit.sh"
         lines = ["#!/bin/bash", "#SBATCH --export=ALL"]
         lines.append("#SBATCH --job-name='{}'".format(job_label))
@@ -732,7 +738,8 @@ class IPySlurmExec(Magics):
             driver_path_relative = driver_path.relative_to(Path.cwd())
         except ValueError:
             driver_path_relative = driver_path
-        command = "exec {python} {driver}".format(
+        # command = "exec {python} {driver}".format(
+        command = "exec {python} -u {driver}".format(
             python=shlex.quote(python_executable), driver=shlex.quote(str(driver_path_relative))
         )
         lines.append("")
@@ -745,6 +752,7 @@ class IPySlurmExec(Magics):
         return submit_path
 
     def _submit_job(self, submit_path):
+        """Submit an sbatch script and return the parsed Slurm job id."""
         process = Popen(["sbatch", str(submit_path)], stdout=PIPE, stderr=PIPE)
         stdout, stderr = process.communicate()
         if process.returncode != 0:
@@ -764,6 +772,7 @@ class IPySlurmExec(Magics):
         return match.group(1)
 
     def _wait_for_job_completion(self, job_id, job_dir, poll_interval, max_wait):
+        """Poll Slurm and job files until the driver reports a final status."""
         status_path = job_dir / "status.json"
         log_path = job_dir / f"slurm-{job_id}.out"
         start_time = time.time()
@@ -773,26 +782,42 @@ class IPySlurmExec(Magics):
         partial_log_line = ""
         last_log_line_width = 0
         last_carriage_line = None
+        defer_status_redraw = False
+        status_cleared_for_log = False
+
+        def _redraw_status_line():
+            """Redraw the current job status after printing job stdout."""
+            if last_status_line is not None:
+                self._write_status_line(last_status_line)
 
         def _emit(line, carriage=False):
-            nonlocal last_log_line_width, last_carriage_line
+            """Print one line from the Slurm stdout log, preserving carriage updates."""
+            nonlocal last_log_line_width, last_carriage_line, status_cleared_for_log
             if line == "":
-                return
+                return False
             if carriage:
                 last_log_line_width = max(last_log_line_width, len(line))
                 sys.stdout.write("\r" + line.ljust(last_log_line_width))
                 sys.stdout.flush()
                 last_carriage_line = line
+                return True
             else:
                 if last_carriage_line is not None and line == last_carriage_line:
                     # Avoid printing the same progress line twice when a newline follows a carriage update.
-                    return
+                    return False
+                if last_status_line is not None and not status_cleared_for_log:
+                    self._clear_status_line()
+                    status_cleared_for_log = True
                 print(line, flush=True)
                 last_log_line_width = 0
                 last_carriage_line = None
+                if not defer_status_redraw:
+                    _redraw_status_line()
+                return True
 
         def _drain_log(force_flush=False):
-            nonlocal log_offset, partial_log_line
+            """Stream newly written Slurm stdout without duplicating partial lines."""
+            nonlocal log_offset, partial_log_line, defer_status_redraw, status_cleared_for_log
             if not log_path.exists():
                 return
             try:
@@ -808,7 +833,10 @@ class IPySlurmExec(Magics):
             text = partial_log_line + chunk.decode("utf-8", "replace")
             idx = 0
             new_partial = ""
+            emitted = False
 
+            defer_status_redraw = True
+            status_cleared_for_log = False
             while idx < len(text):
                 next_nl = text.find("\n", idx)
                 next_cr = text.find("\r", idx)
@@ -819,14 +847,18 @@ class IPySlurmExec(Magics):
                 delim = min(candidates)
                 line = text[idx:delim]
                 carriage = (delim == next_cr)
-                _emit(line, carriage=carriage)
+                emitted = _emit(line, carriage=carriage) or emitted
                 idx = delim + 1
 
             if force_flush and new_partial:
-                _emit(new_partial, carriage=False)
+                emitted = _emit(new_partial, carriage=False) or emitted
                 partial_log_line = ""
             else:
                 partial_log_line = new_partial
+            defer_status_redraw = False
+            if emitted and not force_flush:
+                _redraw_status_line()
+            status_cleared_for_log = False
 
         curr_interval = poll_interval
         while True:
@@ -837,6 +869,8 @@ class IPySlurmExec(Magics):
                         if last_state is not None:
                             self._clear_status_line()
                         _drain_log(force_flush=True)
+                        if last_state is not None:
+                            self._clear_status_line()
                         return result
                     except json.JSONDecodeError:
                         pass
@@ -852,6 +886,9 @@ class IPySlurmExec(Magics):
             if not self._job_active(job_id):
                 if status_path.exists():
                     with open(status_path, "r") as handle:
+                        if last_state is not None:
+                            self._clear_status_line()
+                        _drain_log(force_flush=True)
                         if last_state is not None:
                             self._clear_status_line()
                         return json.load(handle)
@@ -918,6 +955,7 @@ class IPySlurmExec(Magics):
             time.sleep(curr_interval)
 
     def _job_active(self, job_id):
+        """Return True while Slurm still reports the job in squeue."""
         if not self._command_available("squeue"):
             return True
         process = Popen(
@@ -931,9 +969,11 @@ class IPySlurmExec(Magics):
         return bool(stdout.strip())
 
     def _command_available(self, command):
+        """Return True when an external command is available on PATH."""
         return shutil.which(command) is not None
 
     def _current_job_state(self, job_id):
+        """Return the current squeue state and the local time it was checked."""
         if not self._command_available("squeue"):
             return None, None
         process = Popen(["squeue", "-h", "-j", job_id, "-o", "%T",], stdout=PIPE, stderr=PIPE)
@@ -947,6 +987,7 @@ class IPySlurmExec(Magics):
         return state, timestamp
 
     def _query_sacct_job_info(self, job_id):
+        """Return parsed accounting times and final state from sacct when available."""
         if not self._command_available("sacct"):
             return {}
         process = Popen([ "sacct", "-j", job_id, "-o", "Submit,Start,Elapsed,State", "--noheader", "-p" ],
@@ -983,6 +1024,7 @@ class IPySlurmExec(Magics):
         }
 
     def _parse_sacct_timestamp(self, value):
+        """Parse a Slurm accounting timestamp into a datetime, or None."""
         text = (value or "").strip()
         if not text or text == "Unknown":
             return None
@@ -993,6 +1035,7 @@ class IPySlurmExec(Magics):
             return None
 
     def _parse_sacct_elapsed(self, value):
+        """Parse Slurm elapsed time text into seconds, or None."""
         text = (value or "").strip()
         if not text or text == "Unknown":
             return None
@@ -1015,10 +1058,12 @@ class IPySlurmExec(Magics):
         return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
     def _write_status_line(self, message):
+        """Write a transient single-line status update to stdout."""
         sys.stdout.write("\r{msg}".format(msg=message.ljust(80)))
         sys.stdout.flush()
 
     def _format_duration(self, seconds):
+        """Format a duration in seconds as HH:MM:SS."""
         secs = int(max(0, seconds))
         hours, remainder = divmod(secs, 3600)
         minutes, secs = divmod(remainder, 60)
@@ -1029,10 +1074,12 @@ class IPySlurmExec(Magics):
         )
 
     def _clear_status_line(self):
+        """Clear the transient status line from stdout."""
         sys.stdout.write("\r" + " " * 80 + "\r")
         sys.stdout.flush()
 
     def _report_job_efficiency(self, job_id, final_state):
+        """Print reportseff resource-efficiency output for a completed job when available."""
         if not self._command_available("reportseff"):
             if not self._warned_reportseff_missing:
                 # print("Skipping resource efficiency report: 'reportseff' command not found.")
@@ -1086,6 +1133,7 @@ class IPySlurmExec(Magics):
         #     print("  " + ", ".join(values))
 
     def _parse_reportseff_output(self, output_text):
+        """Parse tabular reportseff output into a dictionary of column values."""
         lines = [line for line in output_text.splitlines() if line.strip()]
         if len(lines) < 2:
             return {}
@@ -1097,6 +1145,7 @@ class IPySlurmExec(Magics):
         return {}
 
     def _strip_ansi_codes(self, text):
+        """Remove ANSI colour escape sequences from text."""
         ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
         return ansi_escape.sub("", text)
 

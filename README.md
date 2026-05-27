@@ -4,6 +4,8 @@ Real Slurm magic - execute individual Jupyter Notebook cells on your Slurm clust
 
 ![Simple example](https://github.com/WIMM-IT/ipy-slurm-exec/raw/main/docs/demo.gif)
 
+For internals, see [Architecture](docs/architecture.md).
+
 ## Install
 
 ```
@@ -44,6 +46,19 @@ Skipped variables in Notebook:
   device_vec: 'cudaErrorInsufficientDriver: CUDA driver version is insufficient for CUDA runtime version'
 ```
 
+### Import functions & classes
+
+You can also transfer a function or class that you defined in Notebook, into the Slurm job.
+
+```
+%%slurm_exec -i custom_function ...
+```
+
+To also export all variables:
+
+```
+%%slurm_exec -i custom_function,* ...
+```
 
 ### Slurm job parameters
 
