@@ -36,7 +36,7 @@ _make() (
 	  python -m venv ~/venvs/publish
 	fi
 	source ~/venvs/publish/bin/activate
-	python -m pip install --upgrade pip setuptools wheel build twine
+	python -m pip install --upgrade --uploaded-prior-to P3D pip setuptools wheel build twine
 	python -m build --outdir "$_outdir"
 	deactivate
 
