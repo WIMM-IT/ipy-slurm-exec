@@ -481,7 +481,7 @@ class IPySlurmExec(Magics):
             "capture_all_outputs": capture_all_outputs,
         }
 
-    def _create_job_directory(self, requested_name=''):
+    def _create_job_directory(self, requested_name='ipy-slurm'):
         """Create a unique directory and Slurm-safe label for one submitted job."""
         base = requested_name or ''
         base = re.sub(r"[^A-Za-z0-9._-]", "-", base).strip("-")
