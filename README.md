@@ -4,6 +4,8 @@ Real Slurm magic - execute individual Jupyter Notebook cells on your Slurm clust
 
 ![Simple example](https://github.com/WIMM-IT/ipy-slurm-exec/raw/main/docs/demo.gif)
 
+For internals, see [Architecture](docs/architecture.md).
+
 ## Install
 
 ```
@@ -12,18 +14,18 @@ pip install ipy-slurm-exec
 
 ## `slurm_exec` arguments:
 
-Specify arguments with `%%slurm_exec` to manage variables and the Slurm job.
+Specify arguments with `%%slurm_exec` to manage inputs, outputs, and the Slurm job.
 
 ### Managing variables
 
-If you do not specify a list of variables to export, then all are exported to the Slurm job.
+If you do not specify a list of *input* variables to export, then all are exported into the Slurm job.
 Similarly for importing after the job finishes.
 For large notebooks this may cause problems - 
 overwriting a variable in another part of your notebook, or exporting many big variables that are never used (wasting memory).
-Use these arguments to manage.
+Use these arguments to manage:
 
 ```
--i, --inputs: list of variables to input into the Slurm job
+-i, --inputs: list of input variables to export into the Slurm job
 
 e.g. %%slurm_exec -i data,scale ...
 ```
@@ -34,7 +36,7 @@ e.g. %%slurm_exec -i data,scale ...
 e.g. %%slurm_exec -o reduced ...
 ```
 
-#### Import fail
+#### Output fail
 
 Python variables created in the Slurm job may be dependent on additional modules it loaded that were not loaded by your Notebook, for example CUDA.
 These cannot be imported into Notebook so will be skipped - the execution report will list when this happens e.g.:
@@ -44,6 +46,21 @@ Skipped variables in Notebook:
   device_vec: 'cudaErrorInsufficientDriver: CUDA driver version is insufficient for CUDA runtime version'
 ```
 
+### Input/export functions & classes
+
+You can also export a function or class that you defined in Notebook, into the Slurm job.
+
+```
+%%slurm_exec -i custom_function ...
+```
+
+To also export all variables:
+
+```
+%%slurm_exec -i custom_function,* ...
+```
+
+It is not possible to export all functions, because this would export all functions from all modules you imported (and all modules they imported).
 
 ### Slurm job parameters
 
